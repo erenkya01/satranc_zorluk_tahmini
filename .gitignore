@@ -1,0 +1,19 @@
+# Veri
+data/
+*.db
+*.csv
+*.csv.zst
+
+# Eğitilmiş modeller
+models/
+models_structural_only/
+*.npz
+*.joblib
+*.cbm
+*.pkl
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

@@ -1,4 +1,6 @@
+import json
 import re
+import sqlite3
 from pathlib import Path
 
 import chess
@@ -8,7 +10,21 @@ import numpy as np
 import xgboost as xgb
 from catboost import CatBoostRegressor
 
-FEATURE_COLS = [
+DB_PATH = Path("data") / "puzzles.db"
+MAIA2_SAVE_ROOT = Path("maia2_models")
+ELO_LEVELS_P1 = [1100, 1300, 1500, 1700, 1900]
+ELO_LEVELS_P3 = [1100, 1500, 1900]
+
+PIECE_VALUES = {
+    chess.PAWN: 1,
+    chess.KNIGHT: 3,
+    chess.BISHOP: 3,
+    chess.ROOK: 5,
+    chess.QUEEN: 9,
+    chess.KING: 10,
+}
+
+STRUCTURAL_FEATURE_COLS = [
     "solution_ply",
     "solver_moves_count",
     "ends_in_mate",
@@ -27,21 +43,71 @@ FEATURE_COLS = [
     "material_diff_start",
     "material_diff_end",
     "material_gain",
+    "game_phase",
+    "is_endgame",
+    "solver_turn_white",
     "in_check_at_start",
     "setup_is_capture",
     "setup_is_check",
     "first_move_is_check",
     "first_move_is_capture",
     "first_move_is_quiet",
+    "captured_piece_val_1",
     "is_sacrifice",
     "first_move_piece",
     "first_move_dist",
+    "first_move_is_fork",
+    "first_move_attacks_queen",
+    "first_move_attacks_king_zone",
     "solver_checks",
     "solver_captures",
     "solver_promotions",
+    "total_quiet_solver_moves",
+    "second_solver_move_is_quiet",
+    "max_piece_value_moved",
+    "distinct_solver_pieces_moved",
     "legal_moves_start",
+    "avail_checks_start",
+    "avail_captures_start",
+    "quiet_despite_checks",
+    "opp_legal_moves_ply2",
+    "opp_is_forced_ply2",
+    "solver_legal_moves_ply3",
     "solver_king_attackers",
     "opp_king_attackers",
+    "opp_king_mobility",
+    "solver_pins_count",
+    "opp_pins_count",
+    "total_attacked_opp_pieces",
+    "undefended_opp_pieces",
+    "undefended_solver_pieces",
+]
+
+MAIA2_P1_COLS = [
+    "maia_prob_1100",
+    "maia_prob_1300",
+    "maia_prob_1500",
+    "maia_prob_1700",
+    "maia_prob_1900",
+    "maia_prob_mean",
+    "maia_prob_slope",
+    "maia_top1_prob_1500",
+    "maia_top1_matches_1500",
+    "maia_top1_matches_1900",
+    "maia_move_rank_1500",
+    "maia_prob_ratio_1500",
+    "maia_entropy_1500",
+    "maia_entropy_1900",
+]
+
+MAIA2_P3_COLS = [
+    "has_ply3",
+    "maia_p3_prob_1100",
+    "maia_p3_prob_1500",
+    "maia_p3_prob_1900",
+    "maia_p3_top1_match_1500",
+    "maia_p3_rank_1500",
+    "maia_p3_entropy_1500",
 ]
 
 PIECE_NAMES_TR = {
@@ -53,6 +119,233 @@ PIECE_NAMES_TR = {
     chess.KING: "Şah",
 }
 
+_MAIA2_RUNTIME = None
+
+
+def _get_maia2_runtime():
+    global _MAIA2_RUNTIME
+    if _MAIA2_RUNTIME is not None:
+        return _MAIA2_RUNTIME
+
+    import torch
+    from maia2 import inference as m2_inf
+    from maia2 import model as m2_model
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    raw_moves = m2_inf.get_all_possible_moves()
+    all_moves_dict = (
+        {m: i for i, m in enumerate(raw_moves)}
+        if isinstance(raw_moves, list)
+        else raw_moves
+    )
+    elo_dict = m2_inf.create_elo_dict()
+
+    MAIA2_SAVE_ROOT.mkdir(parents=True, exist_ok=True)
+    maia_net = m2_model.from_pretrained(
+        type="rapid",
+        device=str(device),
+        save_root=str(MAIA2_SAVE_ROOT),
+    )
+    maia_net.eval()
+
+    _MAIA2_RUNTIME = {
+        "torch": torch,
+        "m2_inf": m2_inf,
+        "device": device,
+        "all_moves_dict": all_moves_dict,
+        "elo_dict": elo_dict,
+        "model": maia_net,
+    }
+    return _MAIA2_RUNTIME
+
+
+def compute_maia2_p1_live(puzzle_fen: str, sol_move_uci: str) -> dict:
+    rt = _get_maia2_runtime()
+    torch, m2_inf, device = rt["torch"], rt["m2_inf"], rt["device"]
+    all_moves_dict, elo_dict, maia_net = rt["all_moves_dict"], rt["elo_dict"], rt["model"]
+
+    board = chess.Board(puzzle_fen)
+    is_black = board.turn == chess.BLACK
+    mirrored_sol = m2_inf.mirror_move(sol_move_uci) if is_black else sol_move_uci
+    move_idx = all_moves_dict.get(mirrored_sol, -1)
+    if move_idx < 0:
+        raise ValueError(f"Çözüm hamlesi Maia-2 sözlüğünde bulunamadı: {sol_move_uci}")
+
+    board_input, _, _, legal_mask = m2_inf.preprocessing(
+        puzzle_fen, 1500, 1500, elo_dict, all_moves_dict
+    )
+    boards_t = board_input.unsqueeze(0).to(device)
+    legal_t = legal_mask.unsqueeze(0).float().to(device)
+    neg_inf = torch.tensor(-1e4, device=device, dtype=torch.float32)
+
+    probs_per_elo = []
+    top1_prob_1500 = top1_match_1500 = top1_match_1900 = 0.0
+    rank_1500 = 1.0
+    entropy_1500 = entropy_1900 = 0.0
+
+    with torch.inference_mode():
+        for elo_val in ELO_LEVELS_P1:
+            elo_cat = m2_inf.map_to_category(elo_val, elo_dict)
+            elo_t = torch.tensor([elo_cat], dtype=torch.long, device=device)
+            out = maia_net(boards_t, elo_t, elo_t)
+            logits = (out[0] if isinstance(out, (tuple, list)) else out).float()
+            masked_logits = torch.where(legal_t > 0.5, logits, neg_inf)
+            probs = torch.softmax(masked_logits, dim=-1)
+
+            sol_p = float(probs[0, move_idx].item())
+            probs_per_elo.append(sol_p)
+
+            if elo_val in (1500, 1900):
+                t1_prob, t1_idx = probs.max(dim=-1)
+                matches = float(int(t1_idx.item()) == move_idx)
+                safe_p = torch.clamp(probs, min=1e-12)
+                ent = float(
+                    -torch.sum(
+                        torch.where(legal_t > 0.5, probs * torch.log(safe_p), torch.zeros_like(probs)),
+                        dim=-1,
+                    ).item()
+                )
+                if elo_val == 1500:
+                    top1_prob_1500 = float(t1_prob.item())
+                    top1_match_1500 = matches
+                    entropy_1500 = ent
+                    rank_1500 = float((probs[0] > sol_p).sum().item() + 1.0)
+                else:
+                    top1_match_1900 = matches
+                    entropy_1900 = ent
+
+    p1100, p1300, p1500, p1700, p1900 = probs_per_elo
+    return {
+        "maia_prob_1100": p1100,
+        "maia_prob_1300": p1300,
+        "maia_prob_1500": p1500,
+        "maia_prob_1700": p1700,
+        "maia_prob_1900": p1900,
+        "maia_prob_mean": sum(probs_per_elo) / 5.0,
+        "maia_prob_slope": p1900 - p1100,
+        "maia_top1_prob_1500": top1_prob_1500,
+        "maia_top1_matches_1500": top1_match_1500,
+        "maia_top1_matches_1900": top1_match_1900,
+        "maia_move_rank_1500": rank_1500,
+        "maia_prob_ratio_1500": p1500 / max(top1_prob_1500, 1e-6),
+        "maia_entropy_1500": entropy_1500,
+        "maia_entropy_1900": entropy_1900,
+    }
+
+
+def compute_maia2_p3_live(ply3_fen: str | None, sol2_uci: str | None) -> dict:
+    if not ply3_fen or not sol2_uci:
+        return {
+            "has_ply3": 0.0,
+            "maia_p3_prob_1100": 1.0,
+            "maia_p3_prob_1500": 1.0,
+            "maia_p3_prob_1900": 1.0,
+            "maia_p3_top1_match_1500": 1.0,
+            "maia_p3_rank_1500": 1.0,
+            "maia_p3_entropy_1500": 0.0,
+        }
+
+    rt = _get_maia2_runtime()
+    torch, m2_inf, device = rt["torch"], rt["m2_inf"], rt["device"]
+    all_moves_dict, elo_dict, maia_net = rt["all_moves_dict"], rt["elo_dict"], rt["model"]
+
+    board = chess.Board(ply3_fen)
+    mirrored_sol = m2_inf.mirror_move(sol2_uci) if board.turn == chess.BLACK else sol2_uci
+    move_idx = all_moves_dict.get(mirrored_sol, -1)
+    if move_idx < 0:
+        return {
+            "has_ply3": 0.0,
+            "maia_p3_prob_1100": 1.0,
+            "maia_p3_prob_1500": 1.0,
+            "maia_p3_prob_1900": 1.0,
+            "maia_p3_top1_match_1500": 1.0,
+            "maia_p3_rank_1500": 1.0,
+            "maia_p3_entropy_1500": 0.0,
+        }
+
+    board_input, _, _, legal_mask = m2_inf.preprocessing(
+        ply3_fen, 1500, 1500, elo_dict, all_moves_dict
+    )
+    boards_t = board_input.unsqueeze(0).to(device)
+    legal_t = legal_mask.unsqueeze(0).float().to(device)
+    neg_inf = torch.tensor(-1e4, device=device, dtype=torch.float32)
+
+    probs_per_elo = []
+    top1_match_1500 = 0.0
+    rank_1500 = 1.0
+    entropy_1500 = 0.0
+
+    with torch.inference_mode():
+        for elo_val in ELO_LEVELS_P3:
+            elo_cat = m2_inf.map_to_category(elo_val, elo_dict)
+            elo_t = torch.tensor([elo_cat], dtype=torch.long, device=device)
+            out = maia_net(boards_t, elo_t, elo_t)
+            logits = (out[0] if isinstance(out, (tuple, list)) else out).float()
+            masked_logits = torch.where(legal_t > 0.5, logits, neg_inf)
+            probs = torch.softmax(masked_logits, dim=-1)
+
+            sol_p = float(probs[0, move_idx].item())
+            probs_per_elo.append(sol_p)
+
+            if elo_val == 1500:
+                _, t1_idx = probs.max(dim=-1)
+                top1_match_1500 = float(int(t1_idx.item()) == move_idx)
+                rank_1500 = float((probs[0] > sol_p).sum().item() + 1.0)
+                safe_p = torch.clamp(probs, min=1e-12)
+                entropy_1500 = float(
+                    -torch.sum(
+                        torch.where(legal_t > 0.5, probs * torch.log(safe_p), torch.zeros_like(probs)),
+                        dim=-1,
+                    ).item()
+                )
+
+    return {
+        "has_ply3": 1.0,
+        "maia_p3_prob_1100": probs_per_elo[0],
+        "maia_p3_prob_1500": probs_per_elo[1],
+        "maia_p3_prob_1900": probs_per_elo[2],
+        "maia_p3_top1_match_1500": top1_match_1500,
+        "maia_p3_rank_1500": rank_1500,
+        "maia_p3_entropy_1500": entropy_1500,
+    }
+
+
+def add_v3_interactions_dict(feat_dict: dict) -> None:
+    p1_1500 = float(feat_dict["maia_prob_1500"])
+    p1_1900 = float(feat_dict["maia_prob_1900"])
+    p3_1100 = float(feat_dict["maia_p3_prob_1100"])
+    p3_1500 = float(feat_dict["maia_p3_prob_1500"])
+    p3_1900 = float(feat_dict["maia_p3_prob_1900"])
+    has_p3 = float(feat_dict["has_ply3"])
+    r1_1500 = float(feat_dict["maia_move_rank_1500"])
+    r3_1500 = float(feat_dict["maia_p3_rank_1500"])
+
+    feat_dict["maia_chain_prob_1500"] = p1_1500 * p3_1500
+    feat_dict["maia_chain_prob_1900"] = p1_1900 * p3_1900
+    feat_dict["maia_min_prob_1500"] = min(p1_1500, p3_1500)
+    feat_dict["maia_log_prob_1900"] = float(np.log(np.clip(p1_1900, 1e-6, 1.0)))
+    feat_dict["maia_p3_log_prob_1900"] = float(np.log(np.clip(p3_1900, 1e-6, 1.0)))
+    feat_dict["maia_p3_slope"] = p3_1900 - p3_1100
+    feat_dict["maia_rank_sum_1500"] = r1_1500 + (r3_1500 - 1.0) * has_p3
+
+
+def fetch_table_row_dict(table_name: str, cols: list[str], puzzle_id: str | None) -> dict | None:
+    if not puzzle_id or not DB_PATH.exists():
+        return None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cols_str = ", ".join(cols)
+        row = conn.execute(
+            f"SELECT {cols_str} FROM {table_name} WHERE puzzle_id = ?",
+            (puzzle_id,),
+        ).fetchone()
+        conn.close()
+        if row is None:
+            return None
+        return {col: float(val) for col, val in zip(cols, row)}
+    except Exception:
+        return None
+
 
 def _material_and_counts(board: chess.Board, color: chess.Color):
     pawns = len(board.pieces(chess.PAWN, color))
@@ -60,8 +353,10 @@ def _material_and_counts(board: chess.Board, color: chess.Color):
     bishops = len(board.pieces(chess.BISHOP, color))
     rooks = len(board.pieces(chess.ROOK, color))
     queens = len(board.pieces(chess.QUEEN, color))
-    material = pawns * 1 + (knights + bishops) * 3 + rooks * 5 + queens * 9
-    return pawns, (knights + bishops), rooks, queens, material
+    minors = knights + bishops
+    material = pawns * 1 + minors * 3 + rooks * 5 + queens * 9
+    phase = minors * 1 + rooks * 2 + queens * 4
+    return pawns, minors, rooks, queens, material, phase
 
 
 def _king_zone_pressure(board: chess.Board, king_color: chess.Color) -> int:
@@ -76,7 +371,6 @@ def _king_zone_pressure(board: chess.Board, king_color: chess.Color) -> int:
 
 
 def parse_moves_sequence(fen: str, moves_raw: str) -> list[chess.Move]:
-    """Hem UCI (e2e4 e7e5) hem de PGN/SAN (1. e4 e5 2. Nf3) formatını destekler."""
     cleaned = re.sub(r"\{[^}]*\}", " ", moves_raw)
     cleaned = re.sub(r"\d+\.(\.\.)?", " ", cleaned)
     tokens = [t.strip("!?+#") if len(t) > 4 else t.strip("!?") for t in cleaned.split()]
@@ -100,28 +394,69 @@ class PuzzleDifficultyPredictor:
     def __init__(self, model_dir: str | Path | None = None):
         if model_dir is not None:
             self.model_dir = Path(model_dir)
+        elif Path("models_v3_full").exists():
+            self.model_dir = Path("models_v3_full")
+        elif Path("models_hybrid_maia2").exists():
+            self.model_dir = Path("models_hybrid_maia2")
         elif Path("models_structural_only").exists():
             self.model_dir = Path("models_structural_only")
         else:
             self.model_dir = Path("models")
 
-        self.lgb_model = lgb.Booster(model_file=str(self.model_dir / "lgb_model.txt"))
-        self.xgb_model = xgb.XGBRegressor()
-        self.xgb_model.load_model(str(self.model_dir / "xgb_model.json"))
-        self.cat_model = CatBoostRegressor()
-        self.cat_model.load_model(str(self.model_dir / "cat_model.cbm"))
+        self.is_v3 = (self.model_dir / "lgb_v3.joblib").exists()
+        self.is_v2 = (self.model_dir / "lgb_hybrid.joblib").exists()
+        self.is_hybrid = self.is_v3 or self.is_v2
 
-        meta = joblib.load(self.model_dir / "ensemble_meta.joblib")
-        self.weights = meta["weights"]
+        if self.is_v3:
+            self.lgb_model = joblib.load(self.model_dir / "lgb_v3.joblib")
+            self.xgb_model = xgb.XGBRegressor()
+            self.xgb_model.load_model(str(self.model_dir / "xgb_v3.json"))
+            self.cat_model = CatBoostRegressor()
+            self.cat_model.load_model(str(self.model_dir / "cat_v3.cbm"))
+        elif self.is_v2:
+            self.lgb_model = joblib.load(self.model_dir / "lgb_hybrid.joblib")
+            self.xgb_model = xgb.XGBRegressor()
+            self.xgb_model.load_model(str(self.model_dir / "xgb_hybrid.json"))
+            self.cat_model = CatBoostRegressor()
+            self.cat_model.load_model(str(self.model_dir / "cat_hybrid.cbm"))
 
-        stage2 = joblib.load(self.model_dir / "stage2_artifacts.joblib")
-        self.residual_models = stage2["residual_models"]
-        self.alpha = stage2["alpha"]
-        self.calibrator_type = stage2["calibrator_type"]
-        self.calibrator = stage2["calibrator"]
-        self.uncertainty_scale = stage2["uncertainty_scale"]
+        if self.is_hybrid:
+            with open(self.model_dir / "feature_cols.json", "r", encoding="utf-8") as f:
+                f_info = json.load(f)
+            self.feature_cols = f_info["feature_cols"]
+            self.context_cols = f_info["context_cols"]
 
-    def extract_features_and_states(self, fen: str, moves_raw: str):
+            with open(self.model_dir / "ensemble_weights.json", "r", encoding="utf-8") as f:
+                w_info = json.load(f)
+            self.weights = [w_info["lgb"], w_info["xgb"], w_info["cat"]]
+
+            self.residual_models = joblib.load(self.model_dir / "residual_models.joblib")
+            self.calibrator = joblib.load(self.model_dir / "calibrator.joblib")
+            with open(self.model_dir / "residual_meta.json", "r", encoding="utf-8") as f:
+                r_meta = json.load(f)
+            self.alpha = float(r_meta["alpha"])
+            self.calibrator_type = "Ridge"
+            self.uncertainty_scale = 8.0
+        else:
+            self.lgb_model = lgb.Booster(model_file=str(self.model_dir / "lgb_model.txt"))
+            self.xgb_model = xgb.XGBRegressor()
+            self.xgb_model.load_model(str(self.model_dir / "xgb_model.json"))
+            self.cat_model = CatBoostRegressor()
+            self.cat_model.load_model(str(self.model_dir / "cat_model.cbm"))
+
+            meta = joblib.load(self.model_dir / "ensemble_meta.joblib")
+            self.weights = meta["weights"]
+            self.feature_cols = meta.get("feature_cols", STRUCTURAL_FEATURE_COLS)
+            self.context_cols = []
+
+            stage2 = joblib.load(self.model_dir / "stage2_artifacts.joblib")
+            self.residual_models = stage2["residual_models"]
+            self.alpha = stage2["alpha"]
+            self.calibrator_type = stage2["calibrator_type"]
+            self.calibrator = stage2["calibrator"]
+            self.uncertainty_scale = stage2["uncertainty_scale"]
+
+    def extract_features_and_states(self, fen: str, moves_raw: str, puzzle_id: str | None = None):
         moves = parse_moves_sequence(fen, moves_raw)
         if len(moves) < 2:
             raise ValueError(
@@ -139,67 +474,124 @@ class PuzzleDifficultyPredictor:
             }
         ]
 
-        # 1. Rakibin hazırlık hatası
         setup_move = moves[0]
         setup_san = board.san(setup_move)
         setup_is_capture = int(board.is_capture(setup_move))
         board.push(setup_move)
         setup_is_check = int(board.is_check())
 
+        puzzle_start_fen = board.fen()
+        first_solution_uci = moves[1].uci()
+        ply3_fen = None
+        second_solution_uci = moves[3].uci() if len(moves) >= 4 else None
+
         states.append(
             {
                 "step": 1,
                 "label": f"Rakip Hatası: {setup_san}",
-                "fen": board.fen(),
+                "fen": puzzle_start_fen,
                 "last_move": setup_move,
                 "san": setup_san,
             }
         )
 
-        # Gerçek bulmaca başlangıç pozisyonu
         solver_color = board.turn
         opp_color = not solver_color
+        solver_turn_white = int(solver_color == chess.WHITE)
 
-        s_p, s_m, s_r, s_q, s_mat_start = _material_and_counts(board, solver_color)
-        o_p, o_m, o_r, o_q, o_mat_start = _material_and_counts(board, opp_color)
+        s_p, s_m, s_r, s_q, s_mat_start, s_phase = _material_and_counts(board, solver_color)
+        o_p, o_m, o_r, o_q, o_mat_start, o_phase = _material_and_counts(board, opp_color)
         total_pieces = s_p + s_m + s_r + s_q + o_p + o_m + o_r + o_q + 2
         mat_diff_start = s_mat_start - o_mat_start
+        game_phase = min(24, s_phase + o_phase)
+        is_endgame = int(game_phase <= 6)
 
         in_check_at_start = int(board.is_check())
-        legal_moves_start = board.legal_moves.count()
+
+        legal_moves = list(board.legal_moves)
+        legal_moves_start = len(legal_moves)
+        avail_checks_start = sum(1 for lm in legal_moves if board.gives_check(lm))
+        avail_captures_start = sum(1 for lm in legal_moves if board.is_capture(lm))
+
         solver_king_attackers = _king_zone_pressure(board, solver_color)
         opp_king_attackers = _king_zone_pressure(board, opp_color)
+        opp_king_sq = board.king(opp_color)
+        opp_king_zone_bb = 0
+        opp_king_mobility = 0
+        if opp_king_sq is not None:
+            opp_king_zone_bb = chess.BB_KING_ATTACKS[opp_king_sq] | chess.BB_SQUARES[opp_king_sq]
+            opp_occ = board.occupied_co[opp_color]
+            for sq in chess.SquareSet(chess.BB_KING_ATTACKS[opp_king_sq]):
+                if not (opp_occ & chess.BB_SQUARES[sq]) and not board.is_attacked_by(solver_color, sq):
+                    opp_king_mobility += 1
+
+        solver_pins_count = 0
+        total_attacked_opp_pieces = 0
+        undefended_opp_pieces = 0
+        for sq in chess.SquareSet(board.occupied_co[opp_color]):
+            if board.is_pinned(opp_color, sq):
+                solver_pins_count += 1
+            if board.is_attacked_by(solver_color, sq):
+                total_attacked_opp_pieces += 1
+                if not board.is_attacked_by(opp_color, sq):
+                    undefended_opp_pieces += 1
+
+        opp_pins_count = 0
+        undefended_solver_pieces = 0
+        for sq in chess.SquareSet(board.occupied_co[solver_color]):
+            if board.is_pinned(solver_color, sq):
+                opp_pins_count += 1
+            if board.is_attacked_by(opp_color, sq) and not board.is_attacked_by(solver_color, sq):
+                undefended_solver_pieces += 1
 
         solution_moves = moves[1:]
         solution_ply = len(solution_moves)
         solver_moves_count = (solution_ply + 1) // 2
 
-        first_move_is_check = 0
-        first_move_is_capture = 0
-        first_move_is_quiet = 0
-        first_move_piece = 0
-        first_move_dist = 0
+        first_move_is_check = first_move_is_capture = first_move_is_quiet = 0
+        captured_piece_val_1 = first_move_piece = first_move_dist = 0
+        first_move_is_fork = first_move_attacks_queen = first_move_attacks_king_zone = 0
         is_sacrifice = 0
-        solver_checks = 0
-        solver_captures = 0
-        solver_promotions = 0
+
+        solver_checks = solver_captures = solver_promotions = 0
+        total_quiet_solver_moves = second_solver_move_is_quiet = 0
+        max_piece_value_moved = distinct_solver_pieces_moved = 0
+        last_solver_to_sq = None
+
+        opp_legal_moves_ply2 = opp_is_forced_ply2 = solver_legal_moves_ply3 = 0
 
         for idx, mv in enumerate(solution_moves):
             is_solver_turn = idx % 2 == 0
             san_str = board.san(mv)
             is_cap = board.is_capture(mv)
             is_promo = mv.promotion is not None
+            moving_piece = board.piece_at(mv.from_square)
+            moving_type = moving_piece.piece_type if moving_piece else 0
+
+            if is_solver_turn:
+                p_val = PIECE_VALUES.get(moving_type, 0)
+                if p_val > max_piece_value_moved:
+                    max_piece_value_moved = p_val
+                if mv.from_square != last_solver_to_sq:
+                    distinct_solver_pieces_moved += 1
+                last_solver_to_sq = mv.to_square
 
             if idx == 0:
-                piece = board.piece_at(mv.from_square)
-                first_move_piece = piece.piece_type if piece else 0
+                first_move_piece = moving_type
                 f1, r1 = chess.square_file(mv.from_square), chess.square_rank(mv.from_square)
                 f2, r2 = chess.square_file(mv.to_square), chess.square_rank(mv.to_square)
                 first_move_dist = abs(f1 - f2) + abs(r1 - r2)
                 first_move_is_capture = int(is_cap)
+                if is_cap:
+                    if board.is_en_passant(mv):
+                        captured_piece_val_1 = 1
+                    else:
+                        cap_p = board.piece_at(mv.to_square)
+                        captured_piece_val_1 = PIECE_VALUES.get(cap_p.piece_type, 0) if cap_p else 0
 
             board.push(mv)
             is_chk = board.is_check()
+            is_quiet = not (is_cap or is_chk or is_promo)
 
             actor = "Çözücü" if is_solver_turn else "Rakip"
             states.append(
@@ -214,24 +606,44 @@ class PuzzleDifficultyPredictor:
 
             if idx == 0:
                 first_move_is_check = int(is_chk)
-                first_move_is_quiet = int(not (is_cap or is_chk or is_promo))
+                first_move_is_quiet = int(is_quiet)
+                attacks_bb = int(board.attacks(mv.to_square))
+                opp_occ_bb = int(board.occupied_co[opp_color])
+                first_move_is_fork = int(chess.popcount(attacks_bb & opp_occ_bb) >= 2)
+                first_move_attacks_queen = int(bool(attacks_bb & int(board.pieces(chess.QUEEN, opp_color))))
+                first_move_attacks_king_zone = int(
+                    bool((chess.BB_SQUARES[mv.to_square] | attacks_bb) & opp_king_zone_bb)
+                )
+                opp_legal_moves_ply2 = board.legal_moves.count()
+                opp_is_forced_ply2 = int(opp_legal_moves_ply2 == 1)
 
             if idx == 1:
-                _, _, _, _, s_mat_mid = _material_and_counts(board, solver_color)
-                _, _, _, _, o_mat_mid = _material_and_counts(board, opp_color)
+                _, _, _, _, s_mat_mid, _ = _material_and_counts(board, solver_color)
+                _, _, _, _, o_mat_mid, _ = _material_and_counts(board, opp_color)
                 if (s_mat_mid - o_mat_mid) < mat_diff_start:
                     is_sacrifice = 1
+                if solution_ply >= 3:
+                    solver_legal_moves_ply3 = board.legal_moves.count()
+                    ply3_fen = board.fen()
+
+            if idx == 2:
+                second_solver_move_is_quiet = int(is_quiet)
 
             if is_solver_turn:
                 solver_checks += int(is_chk)
                 solver_captures += int(is_cap)
                 solver_promotions += int(is_promo)
+                total_quiet_solver_moves += int(is_quiet)
+
+        quiet_despite_checks = int(
+            first_move_is_quiet == 1 and (avail_checks_start + avail_captures_start > 0)
+        )
 
         ends_in_mate = int(board.is_checkmate())
         is_mate_in_1 = int(ends_in_mate == 1 and solution_ply == 1)
 
-        _, _, _, _, s_mat_end = _material_and_counts(board, solver_color)
-        _, _, _, _, o_mat_end = _material_and_counts(board, opp_color)
+        _, _, _, _, s_mat_end, _ = _material_and_counts(board, solver_color)
+        _, _, _, _, o_mat_end, _ = _material_and_counts(board, opp_color)
         mat_diff_end = s_mat_end - o_mat_end
         material_gain = mat_diff_end - mat_diff_start
 
@@ -254,28 +666,66 @@ class PuzzleDifficultyPredictor:
             "material_diff_start": mat_diff_start,
             "material_diff_end": mat_diff_end,
             "material_gain": material_gain,
+            "game_phase": game_phase,
+            "is_endgame": is_endgame,
+            "solver_turn_white": solver_turn_white,
             "in_check_at_start": in_check_at_start,
             "setup_is_capture": setup_is_capture,
             "setup_is_check": setup_is_check,
             "first_move_is_check": first_move_is_check,
             "first_move_is_capture": first_move_is_capture,
             "first_move_is_quiet": first_move_is_quiet,
+            "captured_piece_val_1": captured_piece_val_1,
             "is_sacrifice": is_sacrifice,
             "first_move_piece": first_move_piece,
             "first_move_dist": first_move_dist,
+            "first_move_is_fork": first_move_is_fork,
+            "first_move_attacks_queen": first_move_attacks_queen,
+            "first_move_attacks_king_zone": first_move_attacks_king_zone,
             "solver_checks": solver_checks,
             "solver_captures": solver_captures,
             "solver_promotions": solver_promotions,
+            "total_quiet_solver_moves": total_quiet_solver_moves,
+            "second_solver_move_is_quiet": second_solver_move_is_quiet,
+            "max_piece_value_moved": max_piece_value_moved,
+            "distinct_solver_pieces_moved": distinct_solver_pieces_moved,
             "legal_moves_start": legal_moves_start,
+            "avail_checks_start": avail_checks_start,
+            "avail_captures_start": avail_captures_start,
+            "quiet_despite_checks": quiet_despite_checks,
+            "opp_legal_moves_ply2": opp_legal_moves_ply2,
+            "opp_is_forced_ply2": opp_is_forced_ply2,
+            "solver_legal_moves_ply3": solver_legal_moves_ply3,
             "solver_king_attackers": solver_king_attackers,
             "opp_king_attackers": opp_king_attackers,
+            "opp_king_mobility": opp_king_mobility,
+            "solver_pins_count": solver_pins_count,
+            "opp_pins_count": opp_pins_count,
+            "total_attacked_opp_pieces": total_attacked_opp_pieces,
+            "undefended_opp_pieces": undefended_opp_pieces,
+            "undefended_solver_pieces": undefended_solver_pieces,
         }
 
-        X = np.array([[feat_dict[col] for col in FEATURE_COLS]], dtype=np.float32)
+        if self.is_hybrid:
+            m1_feats = fetch_table_row_dict("maia2_features", MAIA2_P1_COLS, puzzle_id)
+            if m1_feats is None:
+                m1_feats = compute_maia2_p1_live(puzzle_start_fen, first_solution_uci)
+            feat_dict.update(m1_feats)
+
+        if self.is_v3:
+            m3_feats = fetch_table_row_dict("maia2_ply3_features", MAIA2_P3_COLS, puzzle_id)
+            if m3_feats is None:
+                m3_feats = compute_maia2_p3_live(ply3_fen, second_solution_uci)
+            feat_dict.update(m3_feats)
+            add_v3_interactions_dict(feat_dict)
+
+        X = np.array([[feat_dict[col] for col in self.feature_cols]], dtype=np.float32)
         return X, feat_dict, states, solver_color
 
-    def predict(self, fen: str, moves_raw: str) -> dict:
-        X, feat_dict, states, solver_color = self.extract_features_and_states(fen, moves_raw)
+    def predict(self, fen: str, moves_raw: str, puzzle_id: str | None = None) -> dict:
+        X, feat_dict, states, solver_color = self.extract_features_and_states(
+            fen, moves_raw, puzzle_id=puzzle_id
+        )
 
         p_lgb = float(self.lgb_model.predict(X)[0])
         p_xgb = float(self.xgb_model.predict(X)[0])
@@ -288,13 +738,36 @@ class PuzzleDifficultyPredictor:
         pred_std = float(np.std(preds_stack))
         pred_range = float(np.max(preds_stack) - np.min(preds_stack))
 
-        X_meta = np.hstack(
-            [
-                X,
-                preds_stack,
-                np.array([[p_ens, pred_std, pred_range, p_lgb - p_cat, p_lgb - p_xgb]], dtype=np.float32),
-            ]
-        )
+        if self.is_hybrid:
+            base_meta = np.array(
+                [
+                    [
+                        p_lgb,
+                        p_xgb,
+                        p_cat,
+                        p_ens,
+                        pred_std,
+                        pred_range,
+                        p_lgb - p_xgb,
+                        p_lgb - p_cat,
+                        p_xgb - p_cat,
+                    ]
+                ],
+                dtype=np.float32,
+            )
+            ctx_arr = np.array([[feat_dict[c] for c in self.context_cols]], dtype=np.float32)
+            X_meta = np.hstack([base_meta, ctx_arr])
+        else:
+            X_meta = np.hstack(
+                [
+                    X,
+                    preds_stack,
+                    np.array(
+                        [[p_ens, pred_std, pred_range, p_lgb - p_cat, p_lgb - p_xgb]],
+                        dtype=np.float32,
+                    ),
+                ]
+            )
 
         res_pred = float(np.mean([m.predict(X_meta)[0] for m in self.residual_models]))
         p_after_res = p_ens + self.alpha * res_pred
@@ -304,8 +777,12 @@ class PuzzleDifficultyPredictor:
         else:
             p_final = float(self.calibrator.predict([[p_after_res]])[0])
 
-        uncertainty_raw = pred_std + 0.25 * abs(res_pred)
-        expected_margin = max(80.0, uncertainty_raw * self.uncertainty_scale)
+        if self.is_hybrid:
+            uncertainty_raw = pred_std + 0.35 * abs(res_pred)
+            expected_margin = float(np.clip(105.0 + uncertainty_raw * self.uncertainty_scale, 105.0, 440.0))
+        else:
+            uncertainty_raw = pred_std + 0.25 * abs(res_pred)
+            expected_margin = max(80.0, uncertainty_raw * self.uncertainty_scale)
 
         return {
             "predicted_rating": round(p_final),
@@ -313,6 +790,8 @@ class PuzzleDifficultyPredictor:
             "ci_low": round(p_final - expected_margin),
             "ci_high": round(p_final + expected_margin),
             "solver_color": "Beyaz" if solver_color == chess.WHITE else "Siyah",
+            "is_hybrid": self.is_hybrid,
+            "is_v3": self.is_v3,
             "models": {
                 "LightGBM": round(p_lgb, 1),
                 "XGBoost": round(p_xgb, 1),

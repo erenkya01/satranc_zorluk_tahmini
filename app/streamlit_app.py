@@ -24,8 +24,8 @@ st.set_page_config(
 
 
 @st.cache_resource
-def get_predictor():
-    return PuzzleDifficultyPredictor()
+def get_predictor(model_dir_str: str):
+    return PuzzleDifficultyPredictor(model_dir=model_dir_str)
 
 
 def fetch_random_test_puzzle(min_rating: int, max_rating: int):
@@ -39,6 +39,21 @@ def fetch_random_test_puzzle(min_rating: int, max_rating: int):
         LIMIT 1
         """,
         (min_rating, max_rating),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def fetch_puzzle_by_id(puzzle_id: str):
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        """
+        SELECT puzzle_id, fen, moves, rating, themes
+        FROM raw_puzzles
+        WHERE puzzle_id = ?
+        LIMIT 1
+        """,
+        (puzzle_id.strip(),),
     ).fetchone()
     conn.close()
     return row
@@ -76,16 +91,40 @@ def main():
     st.title("♟️ Satranç Bulmacalarının Zorluk Derecesi Tahmin Sistemi")
     st.caption(
         "Sivas Cumhuriyet Üniversitesi Bilgisayar Mühendisliği Bitirme Projesi | "
-        "Hibrit GBDT Topluluğu + Artık Öğrenme + Yapısal Özellik Mühendisliği"
+        "Çok Adımlı Maia-2 İnsan Politikası + 84 Öznitelikli Hibrit GBDT + Artık Öğrenme"
     )
 
-    predictor = get_predictor()
-
     with st.sidebar:
+        st.header("Model Mimarisi Seçimi")
+        model_options = {}
+        if (ROOT_DIR / "models_v3_full").exists():
+            model_options["v3: Tam Hibrit (84 Özellik + Ply 1&3 Maia-2 | 241.4 RMSE)"] = str(
+                ROOT_DIR / "models_v3_full"
+            )
+        if (ROOT_DIR / "models_hybrid_maia2").exists():
+            model_options["v2: Hibrit (70 Özellik + Ply 1 Maia-2 | 261.7 RMSE)"] = str(
+                ROOT_DIR / "models_hybrid_maia2"
+            )
+        if (ROOT_DIR / "models_structural_only").exists():
+            model_options["v1: Saf Yapısal (56 Özellik | 282.7 RMSE)"] = str(
+                ROOT_DIR / "models_structural_only"
+            )
+
+        selected_model_label = st.selectbox(
+            "Aktif Tahmin Modeli:",
+            list(model_options.keys()),
+        )
+        predictor = get_predictor(model_options[selected_model_label])
+
+        st.divider()
         st.header("Veri Kaynağı Seçimi")
         mode = st.radio(
             "Çalışma Modu:",
-            ["Test Kümesinden Bulmaca Çek", "Özel Pozisyon Gir (FEN + PGN/UCI)"],
+            [
+                "Test Kümesinden Bulmaca Çek",
+                "Bulmaca ID ile Sorgula",
+                "Özel Pozisyon Gir (FEN + PGN/UCI)",
+            ],
         )
 
         st.divider()
@@ -94,9 +133,33 @@ def main():
         themes = ""
 
         if mode == "Test Kümesinden Bulmaca Çek":
-            rating_range = st.slider(
-                "Hedef Zorluk Aralığı (Glicko-2):", 600, 2800, (1000, 2200), step=100
+            tier_preset = st.selectbox(
+                "Hızlı Zorluk Filtresi:",
+                [
+                    "Tümü (1000 – 2200)",
+                    "Başlangıç (< 1100)",
+                    "Orta (1100 – 1500)",
+                    "İleri (1500 – 1900)",
+                    "Usta Adayı (1900 – 2300)",
+                    "Usta Seviyesi (2300+)",
+                    "Özel Aralık",
+                ],
             )
+            preset_bounds = {
+                "Tümü (1000 – 2200)": (1000, 2200),
+                "Başlangıç (< 1100)": (600, 1099),
+                "Orta (1100 – 1500)": (1100, 1500),
+                "İleri (1500 – 1900)": (1500, 1900),
+                "Usta Adayı (1900 – 2300)": (1900, 2300),
+                "Usta Seviyesi (2300+)": (2300, 2900),
+            }
+            if tier_preset == "Özel Aralık":
+                rating_range = st.slider(
+                    "Hedef Zorluk Aralığı (Glicko-2):", 600, 2900, (1000, 2200), step=100
+                )
+            else:
+                rating_range = preset_bounds[tier_preset]
+
             if "sample_puzzle" not in st.session_state or st.button(
                 "🎲 Yeni Test Bulmacası Getir", use_container_width=True
             ):
@@ -108,27 +171,44 @@ def main():
             sample = st.session_state.get("sample_puzzle")
             if sample:
                 puzzle_id, fen_input, moves_input, actual_rating, themes = sample
-                st.info(f"**Bulmaca ID:** `{puzzle_id}`\n\n**Gerçek Lichess Puanı:** `{actual_rating}`")
+                st.info(
+                    f"**Bulmaca ID:** `{puzzle_id}`\n\n"
+                    f"**Gerçek Lichess Puanı:** `{actual_rating}` ({difficulty_tier(actual_rating)})"
+                )
             else:
+                fen_input = "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4"
+                moves_input = "g8f6 h5f7"
+
+        elif mode == "Bulmaca ID ile Sorgula":
+            query_id = st.text_input("Lichess Bulmaca ID:", value="00Kmw")
+            row = fetch_puzzle_by_id(query_id) if DB_PATH.exists() else None
+            if row:
+                puzzle_id, fen_input, moves_input, actual_rating, themes = row
+                st.info(
+                    f"**Bulmaca ID:** `{puzzle_id}`\n\n"
+                    f"**Gerçek Lichess Puanı:** `{actual_rating}` ({difficulty_tier(actual_rating)})"
+                )
+            else:
+                st.warning("Bu ID veritabanında bulunamadı.")
                 fen_input = "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4"
                 moves_input = "g8f6 h5f7"
         else:
             st.markdown("Dışarıdan herhangi bir FEN ve çözüm hamlelerini (UCI veya PGN) yapıştırın:")
             fen_input = st.text_input(
                 "FEN Pozisyonu:",
-                value="r2q1rk1/ppp2ppp/2n1bn2/2b1p3/4P3/2NP1N2/PPP1BPPP/R1BQ1RK1 b - - 0 8",
+                value="8/8/3k1K1p/4P1pP/6P1/1p6/8/8 b - - 0 1",
             )
             moves_input = st.text_area(
                 "Hamle Dizisi (1. hamle rakip hatası, devamı çözüm):",
-                value="c6d4 f3d4 c5d4",
+                value="d6d7 e5e6 d7e8 f6g7 b3b2 g7h6",
                 height=90,
             )
 
         st.divider()
-        st.caption(f"Aktif Model Dizini: `{predictor.model_dir.name}`")
+        st.caption(f"Aktif Dizin: `{predictor.model_dir.name}`")
 
     try:
-        result = predictor.predict(fen_input, moves_input)
+        result = predictor.predict(fen_input, moves_input, puzzle_id=puzzle_id)
     except Exception as exc:
         st.error(f"Pozisyon veya hamle dizisi çözümlenemedi: {exc}")
         return
@@ -141,18 +221,26 @@ def main():
     # Üst Metrik Kartları
     col_m1, col_m2, col_m3, col_m4 = st.columns(4)
     col_m1.metric("Tahmini Glicko-2 Zorluğu", f"{pred_rating} Elo")
-    col_m2.metric("Belirsizlik Aralığı", f"{result['ci_low']} – {result['ci_high']}", delta=f"±{margin} Elo", delta_color="off")
-    col_m3.metric("Zorluk Kategorisi", difficulty_tier(pred_rating))
+    col_m2.metric(
+        "Belirsizlik Aralığı",
+        f"{result['ci_low']} – {result['ci_high']}",
+        delta=f"±{margin} Elo",
+        delta_color="off",
+    )
+    col_m3.metric("Tahmini Zorluk Sınıfı", difficulty_tier(pred_rating))
 
     if actual_rating is not None:
         diff = pred_rating - actual_rating
-        col_m4.metric("Gerçek Lichess Puanı", f"{actual_rating} Elo", delta=f"Fark: {diff:+d} Elo")
+        col_m4.metric(
+            f"Gerçek Sınıf ({difficulty_tier(actual_rating).split()[0]})",
+            f"{actual_rating} Elo",
+            delta=f"Fark: {diff:+d} Elo",
+        )
     else:
         col_m4.metric("Çözüm Derinliği", f"{feats['solver_moves_count']} Hamle ({feats['solution_ply']} ply)")
 
     st.divider()
 
-    # Sol: Etkileşimli Satranç Tahtası | Sağ: Model Kırılımı ve Yapısal Analiz
     left_col, right_col = st.columns([1.05, 1.15])
 
     with left_col:
@@ -180,6 +268,28 @@ def main():
             list(result["models"].items()), columns=["Model / Aşama", "Puan / Katkı"]
         )
         st.dataframe(model_df, use_container_width=True, hide_index=True)
+
+        if result["is_hybrid"] and "maia_prob_1500" in feats:
+            st.subheader("Maia-2 İnsan Politikası Analizi")
+            maia_rows = [
+                ("1. Hamle (Ply 1) İnsan Olasılığı (1500 Elo)", f"%{feats['maia_prob_1500'] * 100:.1f} (Sıra: {int(feats['maia_move_rank_1500'])})"),
+                ("1. Hamle (Ply 1) Usta Olasılığı (1900 Elo)", f"%{feats['maia_prob_1900'] * 100:.1f}"),
+            ]
+            if result.get("is_v3") and feats.get("has_ply3", 0.0) >= 0.5:
+                maia_rows.extend(
+                    [
+                        ("2. Hamle (Ply 3) İnsan Olasılığı (1500 Elo)", f"%{feats['maia_p3_prob_1500'] * 100:.1f} (Sıra: {int(feats['maia_p3_rank_1500'])})"),
+                        ("Zincirleme Bulunma Olasılığı (Ply 1 × Ply 3)", f"%{feats['maia_chain_prob_1500'] * 100:.1f}"),
+                    ]
+                )
+            maia_rows.extend(
+                [
+                    ("Yetenek Ayrım Eğimi (1900 − 1100)", f"{feats['maia_prob_slope'] * 100:+.1f} puan"),
+                    ("Karar Belirsizliği Entropisi (1500 Elo)", f"{feats['maia_entropy_1500']:.2f} nat"),
+                ]
+            )
+            maia_df = pd.DataFrame(maia_rows, columns=["Maia-2 Bilişsel Öznitelik", "Değer"])
+            st.dataframe(maia_df, use_container_width=True, hide_index=True)
 
         st.subheader("Zorluğu Belirleyen Yapısal Etkenler")
         piece_name = PIECE_NAMES_TR.get(feats["first_move_piece"], "-")

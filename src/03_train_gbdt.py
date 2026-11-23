@@ -10,10 +10,10 @@ import pandas as pd
 import xgboost as xgb
 from catboost import CatBoostRegressor
 from scipy.optimize import minimize
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 DB_PATH = Path("data") / "puzzles.db"
-MODELS_DIR = Path("models")
+MODELS_DIR = Path("models_structural_only")
 RANDOM_SEED = 42
 
 FEATURE_COLS = [
@@ -35,26 +35,49 @@ FEATURE_COLS = [
     "material_diff_start",
     "material_diff_end",
     "material_gain",
+    "game_phase",
+    "is_endgame",
+    "solver_turn_white",
     "in_check_at_start",
     "setup_is_capture",
     "setup_is_check",
     "first_move_is_check",
     "first_move_is_capture",
     "first_move_is_quiet",
+    "captured_piece_val_1",
     "is_sacrifice",
     "first_move_piece",
     "first_move_dist",
+    "first_move_is_fork",
+    "first_move_attacks_queen",
+    "first_move_attacks_king_zone",
     "solver_checks",
     "solver_captures",
     "solver_promotions",
+    "total_quiet_solver_moves",
+    "second_solver_move_is_quiet",
+    "max_piece_value_moved",
+    "distinct_solver_pieces_moved",
     "legal_moves_start",
+    "avail_checks_start",
+    "avail_captures_start",
+    "quiet_despite_checks",
+    "opp_legal_moves_ply2",
+    "opp_is_forced_ply2",
+    "solver_legal_moves_ply3",
     "solver_king_attackers",
     "opp_king_attackers",
+    "opp_king_mobility",
+    "solver_pins_count",
+    "opp_pins_count",
+    "total_attacked_opp_pieces",
+    "undefended_opp_pieces",
+    "undefended_solver_pieces",
 ]
 
 
 def load_datasets():
-    print("Veritabanından öznitelikler ve etiketler yükleniyor...")
+    print(f"Veritabanından {len(FEATURE_COLS)} öznitelik ve etiketler yükleniyor...")
     t0 = time.time()
     conn = sqlite3.connect(DB_PATH)
     cols_sql = ", ".join([f"f.{c}" for c in FEATURE_COLS])
@@ -98,7 +121,9 @@ def load_datasets():
 def eval_metrics(y_true, y_pred):
     mse = float(mean_squared_error(y_true, y_pred))
     rmse = float(np.sqrt(mse))
-    return mse, rmse
+    mae = float(mean_absolute_error(y_true, y_pred))
+    r2 = float(r2_score(y_true, y_pred))
+    return mse, rmse, mae, r2
 
 
 def train_lightgbm(data):
@@ -234,8 +259,8 @@ def main():
 
     # 0. Naif Ortalama Taban Çizgisi (Dummy Baseline)
     mean_rating = float(np.mean(data["y_train"]))
-    base_val_mse, base_val_rmse = eval_metrics(data["y_val"], np.full_like(data["y_val"], mean_rating))
-    base_test_mse, base_test_rmse = eval_metrics(data["y_test"], np.full_like(data["y_test"], mean_rating))
+    base_val = eval_metrics(data["y_val"], np.full_like(data["y_val"], mean_rating))
+    base_test = eval_metrics(data["y_test"], np.full_like(data["y_test"], mean_rating))
 
     # 1-3. GBDT Modelleri
     lgb_model, val_lgb, test_lgb = train_lightgbm(data)
@@ -247,31 +272,40 @@ def main():
     val_ens = weights[0] * val_lgb + weights[1] * val_xgb + weights[2] * val_cat
     test_ens = weights[0] * test_lgb + weights[1] * test_xgb + weights[2] * test_cat
 
-    # Sonuç Tablosu
+    # Sonuç Tablosu (Tezde Test sütunları esas alınır)
     results = [
-        ("Ortalama Taban (Baseline)", base_val_mse, base_val_rmse, base_test_mse, base_test_rmse),
-        ("LightGBM", *eval_metrics(data["y_val"], val_lgb), *eval_metrics(data["y_test"], test_lgb)),
-        ("XGBoost", *eval_metrics(data["y_val"], val_xgb), *eval_metrics(data["y_test"], test_xgb)),
-        ("CatBoost", *eval_metrics(data["y_val"], val_cat), *eval_metrics(data["y_test"], test_cat)),
-        ("3'lü GBDT Topluluğu", *eval_metrics(data["y_val"], val_ens), *eval_metrics(data["y_test"], test_ens)),
+        ("Ortalama Taban (Baseline)", base_val[1], base_test[0], base_test[1], base_test[2], base_test[3]),
+        ("LightGBM (56 Özellik)", eval_metrics(data["y_val"], val_lgb)[1], *eval_metrics(data["y_test"], test_lgb)),
+        ("XGBoost (56 Özellik)", eval_metrics(data["y_val"], val_xgb)[1], *eval_metrics(data["y_test"], test_xgb)),
+        ("CatBoost (56 Özellik)", eval_metrics(data["y_val"], val_cat)[1], *eval_metrics(data["y_test"], test_cat)),
+        ("3'lü GBDT Topluluğu", eval_metrics(data["y_val"], val_ens)[1], *eval_metrics(data["y_test"], test_ens)),
     ]
 
     summary_df = pd.DataFrame(
-        results, columns=["Model", "Val_MSE", "Val_RMSE", "Test_MSE", "Test_RMSE"]
+        results, columns=["Model", "Val_RMSE", "Test_MSE", "Test_RMSE", "Test_MAE", "Test_R2"]
     )
-    print("\n================ FAZ 3 MODEL KARŞILAŞTIRMASI ================")
+    print("\n================ FAZ 3 MODEL KARŞILAŞTIRMASI (56 ÖZNİTELİK) ================")
     print(
         f"Optimal Topluluk Ağırlıkları -> LightGBM: {weights[0]:.3f} | "
         f"XGBoost: {weights[1]:.3f} | CatBoost: {weights[2]:.3f}\n"
     )
-    print(summary_df.to_string(index=False, float_format=lambda x: f"{x:,.2f}"))
+    print(summary_df.to_string(index=False, float_format=lambda x: f"{x:,.3f}"))
 
-    # En önemli 10 yapısal öznitelik
+    # Gain tabanlı öznitelik önem sıralaması
+    gain_scores = lgb_model.booster_.feature_importance(importance_type="gain")
+    split_scores = lgb_model.booster_.feature_importance(importance_type="split")
     imp_df = pd.DataFrame(
-        {"Ozellik": FEATURE_COLS, "Onem_Skoru": lgb_model.feature_importances_}
-    ).sort_values("Onem_Skoru", ascending=False)
-    print("\n--- EN ÖNEMLİ 10 YAPISAL ÖZNİTELİK (LightGBM) ---")
-    print(imp_df.head(10).to_string(index=False))
+        {
+            "Ozellik": FEATURE_COLS,
+            "Gain_Onemi": gain_scores,
+            "Gain_Yuzde": 100.0 * gain_scores / max(np.sum(gain_scores), 1e-8),
+            "Split_Sayisi": split_scores,
+        }
+    ).sort_values("Gain_Onemi", ascending=False)
+    imp_df.to_csv(MODELS_DIR / "feature_importance_gain.csv", index=False)
+
+    print("\n--- EN ÖNEMLİ 15 YAPISAL ÖZNİTELİK (LightGBM Gain) ---")
+    print(imp_df.head(15).to_string(index=False, float_format=lambda x: f"{x:,.2f}"))
 
     # Modelleri ve Faz 4 tahminlerini kaydet
     lgb_model.booster_.save_model(str(MODELS_DIR / "lgb_model.txt"))
@@ -296,7 +330,7 @@ def main():
         test_cat=test_cat,
         test_ens=test_ens,
     )
-    print(f"\nModeller ve Faz 4 tahminleri '{MODELS_DIR}/' klasörüne kaydedildi.")
+    print(f"\nModeller, gain tablosu ve Faz 4 tahminleri '{MODELS_DIR}/' klasörüne kaydedildi.")
 
 
 if __name__ == "__main__":

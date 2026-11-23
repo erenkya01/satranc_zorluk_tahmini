@@ -6,17 +6,19 @@ import pandas as pd
 from scipy.optimize import minimize_scalar
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import Ridge
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import KFold
 
-MODELS_DIR = Path("models")
+MODELS_DIR = Path("models_structural_only")
 RANDOM_SEED = 42
 
 
 def eval_metrics(y_true, y_pred):
     mse = float(mean_squared_error(y_true, y_pred))
     rmse = float(np.sqrt(mse))
-    return mse, rmse
+    mae = float(mean_absolute_error(y_true, y_pred))
+    r2 = float(r2_score(y_true, y_pred))
+    return mse, rmse, mae, r2
 
 
 def build_meta_features(X, p_lgb, p_xgb, p_cat, p_ens):
@@ -40,17 +42,15 @@ def build_meta_features(X, p_lgb, p_xgb, p_cat, p_ens):
 def compute_uncertainty_mask_ratio(y_true, y_pred, uncertainty_score, drop_ratio=0.10):
     """
     FedCSIS 2025 belirsizlik maskesi metriği (N/P oranı):
-    En belirsiz %10'luk dilim çıkarıldıktan sonraki MSE / Mükemmel maske MSE.
+    En belirsiz %10'luk dilim çıkarıldıktan sonraki MSE / Teorik mükemmel maske MSE.
     """
     n = len(y_true)
     k_drop = int(n * drop_ratio)
     sq_errors = (y_true - y_pred) ** 2
 
-    # Modelin kendi belirsizlik skoruna göre en belirsiz %10'u çıkar
     keep_model_idx = np.argsort(uncertainty_score)[: n - k_drop]
     mse_model_masked = float(np.mean(sq_errors[keep_model_idx]))
 
-    # Teorik mükemmel maske (en büyük gerçek hataya sahip %10 çıkarılsaydı)
     keep_oracle_idx = np.argsort(sq_errors)[: n - k_drop]
     mse_oracle_masked = float(np.mean(sq_errors[keep_oracle_idx]))
 
@@ -61,7 +61,9 @@ def compute_uncertainty_mask_ratio(y_true, y_pred, uncertainty_score, drop_ratio
 def main():
     npz_path = MODELS_DIR / "stage1_predictions.npz"
     if not npz_path.exists():
-        raise FileNotFoundError("models/stage1_predictions.npz bulunamadı! Önce 03_train_gbdt.py çalıştırın.")
+        raise FileNotFoundError(
+            f"'{npz_path}' bulunamadı! Önce güncel 03_train_gbdt.py betiğini çalıştırın."
+        )
 
     print("Faz 3 tahminleri yükleniyor...")
     d = np.load(npz_path)
@@ -87,13 +89,17 @@ def main():
     X_meta_test = build_meta_features(X_test, test_lgb, test_xgb, test_cat, test_ens)
     val_residuals = y_val - val_ens
 
-    print("Artık Öğrenme (Residual GBDT) 5-Katlı Çapraz Doğrulama ile eğitiliyor...")
+    print("Artık Öğrenme (Residual GBDT) 5-Katlı Sızıntısız Çapraz Doğrulama ile eğitiliyor...")
     kf = KFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED)
     oof_res_pred = np.zeros(len(y_val), dtype=np.float64)
     test_res_pred = np.zeros(len(y_test), dtype=np.float64)
     residual_models = []
 
     for fold, (tr_idx, va_idx) in enumerate(kf.split(X_meta_val), start=1):
+        # Dışarıda kalan va_idx katmanına bakmadan tr_idx içinden erken durdurma ayrımı yap
+        sub_cut = int(len(tr_idx) * 0.9)
+        es_tr_idx, es_va_idx = tr_idx[:sub_cut], tr_idx[sub_cut:]
+
         res_model = lgb.LGBMRegressor(
             n_estimators=600,
             learning_rate=0.03,
@@ -109,9 +115,9 @@ def main():
             verbose=-1,
         )
         res_model.fit(
-            X_meta_val[tr_idx],
-            val_residuals[tr_idx],
-            eval_set=[(X_meta_val[va_idx], val_residuals[va_idx])],
+            X_meta_val[es_tr_idx],
+            val_residuals[es_tr_idx],
+            eval_set=[(X_meta_val[es_va_idx], val_residuals[es_va_idx])],
             callbacks=[lgb.early_stopping(stopping_rounds=40, verbose=False)],
         )
         oof_res_pred[va_idx] = res_model.predict(X_meta_val[va_idx])
@@ -162,11 +168,10 @@ def main():
     val_model_std = np.std(np.column_stack([val_lgb, val_xgb, val_cat]), axis=1)
     test_model_std = np.std(np.column_stack([test_lgb, test_xgb, test_cat]), axis=1)
 
-    # Belirsizlik skoru: modeller arası anlaşmazlık + artık büyüklüğü
     val_uncertainty = val_model_std + 0.25 * np.abs(oof_res_pred)
     test_uncertainty = test_model_std + 0.25 * np.abs(test_res_pred)
 
-    # Kalibrasyon katsayısı: uncertainty_score -> beklenen mutlak hata ölçeği
+    # Medyan mutlak hata tabanlı beklenen hata payı ölçeği (~%50 kapsama)
     abs_err_val = np.abs(y_val - val_final)
     uncertainty_scale = float(np.median(abs_err_val) / max(np.median(val_uncertainty), 1e-6))
 
@@ -174,24 +179,24 @@ def main():
         y_test, test_final, test_uncertainty, drop_ratio=0.10
     )
 
-    # 4. Tam Ablasyon Tablosu
+    # 4. Tam Ablasyon Tablosu (Test seti ana değerlendirme metriğidir)
     ablation_rows = [
-        ("0. Ortalama Taban (Baseline)", *eval_metrics(y_val, np.full_like(y_val, np.mean(y_val))), *eval_metrics(y_test, np.full_like(y_test, np.mean(y_val)))),
-        ("1. Tekil LightGBM (Yapısal)", *eval_metrics(y_val, val_lgb), *eval_metrics(y_test, test_lgb)),
-        ("2. Tekil XGBoost (Yapısal)", *eval_metrics(y_val, val_xgb), *eval_metrics(y_test, test_xgb)),
-        ("3. Tekil CatBoost (Yapısal)", *eval_metrics(y_val, val_cat), *eval_metrics(y_test, test_cat)),
-        ("4. 3'lü GBDT Topluluğu (Ensemble)", *eval_metrics(y_val, val_ens), *eval_metrics(y_test, test_ens)),
-        ("5. + Artık Öğrenme (Residual)", *eval_metrics(y_val, val_after_res), *eval_metrics(y_test, test_after_res)),
-        (f"6. + {cal_name} (Nihai)", *eval_metrics(y_val, val_final), *eval_metrics(y_test, test_final)),
+        ("0. Ortalama Taban (Baseline)", eval_metrics(y_val, np.full_like(y_val, np.mean(y_val)))[1], *eval_metrics(y_test, np.full_like(y_test, np.mean(y_val)))),
+        ("1. Tekil LightGBM (56 Özellik)", eval_metrics(y_val, val_lgb)[1], *eval_metrics(y_test, test_lgb)),
+        ("2. Tekil XGBoost (56 Özellik)", eval_metrics(y_val, val_xgb)[1], *eval_metrics(y_test, test_xgb)),
+        ("3. Tekil CatBoost (56 Özellik)", eval_metrics(y_val, val_cat)[1], *eval_metrics(y_test, test_cat)),
+        ("4. 3'lü GBDT Topluluğu (Ensemble)", eval_metrics(y_val, val_ens)[1], *eval_metrics(y_test, test_ens)),
+        ("5. + Artık Öğrenme (Residual)", eval_metrics(y_val, val_after_res)[1], *eval_metrics(y_test, test_after_res)),
+        (f"6. + {cal_name} (Nihai)", eval_metrics(y_val, val_final)[1], *eval_metrics(y_test, test_final)),
     ]
 
     ablation_df = pd.DataFrame(
-        ablation_rows, columns=["Asama", "Val_MSE", "Val_RMSE", "Test_MSE", "Test_RMSE"]
+        ablation_rows, columns=["Asama", "Val_RMSE", "Test_MSE", "Test_RMSE", "Test_MAE", "Test_R2"]
     )
     ablation_df.to_csv(MODELS_DIR / "ablation_structural_only.csv", index=False)
 
-    print("\n================ TEZ ABLASYON TABLOSU (YAPISAL ÖZNİTELİKLER) ================")
-    print(ablation_df.to_string(index=False, float_format=lambda x: f"{x:,.2f}"))
+    print("\n================ TEZ ABLASYON TABLOSU (56 YAPISAL ÖZNİTELİK) ================")
+    print(ablation_df.to_string(index=False, float_format=lambda x: f"{x:,.3f}"))
 
     print("\n================ BELİRSİZLİK VE MASKE ANALİZİ (TEST SETİ) ================")
     print(f"Tam Test Seti MSE (%100 veri)      : {mean_squared_error(y_test, test_final):,.2f}")
@@ -199,7 +204,6 @@ def main():
     print(f"Teorik Mükemmel Maske MSE          : {oracle_mse:,.2f}")
     print(f"FedCSIS 2025 Maske Oranı (N/P)     : {np_ratio:.3f} (Literatür aralığı: 1.43 - 1.71)")
 
-    # Faz 4 bileşenlerini kaydet
     joblib.dump(
         {
             "residual_models": residual_models,

@@ -4,13 +4,17 @@ data/
 *.csv
 *.csv.zst
 
-# Eğitilmiş modeller
+# Eğitilmiş modeller ve ön-eğitimli ağırlıklar
 models/
 models_structural_only/
+models_hybrid_maia2/
+models_v3_full/
+maia2_models/
 *.npz
 *.joblib
 *.cbm
 *.pkl
+*.pt
 
 # Python
 __pycache__/

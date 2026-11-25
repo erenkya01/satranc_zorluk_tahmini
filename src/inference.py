@@ -110,6 +110,26 @@ MAIA2_P3_COLS = [
     "maia_p3_entropy_1500",
 ]
 
+MAIA2_V4_COLS = [
+    "maia_top1_prob_1900",
+    "maia_top2_prob_1900",
+    "maia_top1_top2_gap_1900",
+    "maia_move_rank_1900",
+    "maia_prob_ratio_1900",
+    "maia_blitz_prob_1500",
+    "maia_blitz_prob_1900",
+    "maia_rapid_minus_blitz_1900",
+    "maia_blitz_trap_gap_1900",
+    "maia_blitz_rapid_top1_agree",
+    "opp_p2_entropy_1900",
+    "opp_p2_top1_prob_1900",
+    "opp_p2_sol_prob_1900",
+    "has_ply5",
+    "maia_p5_prob_1500",
+    "maia_p5_prob_1900",
+    "maia_p5_rank_1900",
+]
+
 PIECE_NAMES_TR = {
     chess.PAWN: "Piyon",
     chess.KNIGHT: "At",
@@ -122,97 +142,111 @@ PIECE_NAMES_TR = {
 _MAIA2_RUNTIME = None
 
 
-def _get_maia2_runtime():
+def _get_maia2_runtime(need_blitz: bool = False):
     global _MAIA2_RUNTIME
-    if _MAIA2_RUNTIME is not None:
-        return _MAIA2_RUNTIME
-
     import torch
     from maia2 import inference as m2_inf
     from maia2 import model as m2_model
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    raw_moves = m2_inf.get_all_possible_moves()
-    all_moves_dict = (
-        {m: i for i, m in enumerate(raw_moves)}
-        if isinstance(raw_moves, list)
-        else raw_moves
-    )
-    elo_dict = m2_inf.create_elo_dict()
+    if _MAIA2_RUNTIME is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        raw_moves = m2_inf.get_all_possible_moves()
+        all_moves_dict = (
+            {m: i for i, m in enumerate(raw_moves)}
+            if isinstance(raw_moves, list)
+            else raw_moves
+        )
+        elo_dict = m2_inf.create_elo_dict()
 
-    MAIA2_SAVE_ROOT.mkdir(parents=True, exist_ok=True)
-    maia_net = m2_model.from_pretrained(
-        type="rapid",
-        device=str(device),
-        save_root=str(MAIA2_SAVE_ROOT),
-    )
-    maia_net.eval()
+        MAIA2_SAVE_ROOT.mkdir(parents=True, exist_ok=True)
+        maia_net = m2_model.from_pretrained(
+            type="rapid",
+            device=str(device),
+            save_root=str(MAIA2_SAVE_ROOT),
+        )
+        maia_net.eval()
 
-    _MAIA2_RUNTIME = {
-        "torch": torch,
-        "m2_inf": m2_inf,
-        "device": device,
-        "all_moves_dict": all_moves_dict,
-        "elo_dict": elo_dict,
-        "model": maia_net,
-    }
+        _MAIA2_RUNTIME = {
+            "torch": torch,
+            "m2_inf": m2_inf,
+            "device": device,
+            "all_moves_dict": all_moves_dict,
+            "elo_dict": elo_dict,
+            "model": maia_net,
+            "blitz_model": None,
+        }
+
+    if need_blitz and _MAIA2_RUNTIME["blitz_model"] is None:
+        blitz_net = m2_model.from_pretrained(
+            type="blitz",
+            device=str(_MAIA2_RUNTIME["device"]),
+            save_root=str(MAIA2_SAVE_ROOT),
+        )
+        blitz_net.eval()
+        _MAIA2_RUNTIME["blitz_model"] = blitz_net
+
     return _MAIA2_RUNTIME
 
 
-def compute_maia2_p1_live(puzzle_fen: str, sol_move_uci: str) -> dict:
-    rt = _get_maia2_runtime()
+def _eval_single_board_probs(net, rt, fen_str: str, elo_val: int):
     torch, m2_inf, device = rt["torch"], rt["m2_inf"], rt["device"]
-    all_moves_dict, elo_dict, maia_net = rt["all_moves_dict"], rt["elo_dict"], rt["model"]
-
-    board = chess.Board(puzzle_fen)
-    is_black = board.turn == chess.BLACK
-    mirrored_sol = m2_inf.mirror_move(sol_move_uci) if is_black else sol_move_uci
-    move_idx = all_moves_dict.get(mirrored_sol, -1)
-    if move_idx < 0:
-        raise ValueError(f"Çözüm hamlesi Maia-2 sözlüğünde bulunamadı: {sol_move_uci}")
+    all_moves_dict, elo_dict = rt["all_moves_dict"], rt["elo_dict"]
 
     board_input, _, _, legal_mask = m2_inf.preprocessing(
-        puzzle_fen, 1500, 1500, elo_dict, all_moves_dict
+        fen_str, elo_val, elo_val, elo_dict, all_moves_dict
     )
     boards_t = board_input.unsqueeze(0).to(device)
     legal_t = legal_mask.unsqueeze(0).float().to(device)
     neg_inf = torch.tensor(-1e4, device=device, dtype=torch.float32)
+
+    elo_cat = m2_inf.map_to_category(elo_val, elo_dict)
+    elo_t = torch.tensor([elo_cat], dtype=torch.long, device=device)
+    with torch.inference_mode():
+        out = net(boards_t, elo_t, elo_t)
+        logits = (out[0] if isinstance(out, (tuple, list)) else out).float()
+        masked_logits = torch.where(legal_t > 0.5, logits, neg_inf)
+        probs = torch.softmax(masked_logits, dim=-1)[0]
+    return probs, legal_t[0]
+
+
+def compute_maia2_p1_live(puzzle_fen: str, sol_move_uci: str) -> dict:
+    rt = _get_maia2_runtime(need_blitz=False)
+    torch, m2_inf, maia_net = rt["torch"], rt["m2_inf"], rt["model"]
+    all_moves_dict = rt["all_moves_dict"]
+
+    board = chess.Board(puzzle_fen)
+    mirrored_sol = m2_inf.mirror_move(sol_move_uci) if board.turn == chess.BLACK else sol_move_uci
+    move_idx = all_moves_dict.get(mirrored_sol, -1)
+    if move_idx < 0:
+        raise ValueError(f"Çözüm hamlesi Maia-2 sözlüğünde bulunamadı: {sol_move_uci}")
 
     probs_per_elo = []
     top1_prob_1500 = top1_match_1500 = top1_match_1900 = 0.0
     rank_1500 = 1.0
     entropy_1500 = entropy_1900 = 0.0
 
-    with torch.inference_mode():
-        for elo_val in ELO_LEVELS_P1:
-            elo_cat = m2_inf.map_to_category(elo_val, elo_dict)
-            elo_t = torch.tensor([elo_cat], dtype=torch.long, device=device)
-            out = maia_net(boards_t, elo_t, elo_t)
-            logits = (out[0] if isinstance(out, (tuple, list)) else out).float()
-            masked_logits = torch.where(legal_t > 0.5, logits, neg_inf)
-            probs = torch.softmax(masked_logits, dim=-1)
+    for elo_val in ELO_LEVELS_P1:
+        probs, legal_1d = _eval_single_board_probs(maia_net, rt, puzzle_fen, elo_val)
+        sol_p = float(probs[move_idx].item())
+        probs_per_elo.append(sol_p)
 
-            sol_p = float(probs[0, move_idx].item())
-            probs_per_elo.append(sol_p)
-
-            if elo_val in (1500, 1900):
-                t1_prob, t1_idx = probs.max(dim=-1)
-                matches = float(int(t1_idx.item()) == move_idx)
-                safe_p = torch.clamp(probs, min=1e-12)
-                ent = float(
-                    -torch.sum(
-                        torch.where(legal_t > 0.5, probs * torch.log(safe_p), torch.zeros_like(probs)),
-                        dim=-1,
-                    ).item()
-                )
-                if elo_val == 1500:
-                    top1_prob_1500 = float(t1_prob.item())
-                    top1_match_1500 = matches
-                    entropy_1500 = ent
-                    rank_1500 = float((probs[0] > sol_p).sum().item() + 1.0)
-                else:
-                    top1_match_1900 = matches
-                    entropy_1900 = ent
+        if elo_val in (1500, 1900):
+            t1_prob, t1_idx = probs.max(dim=-1)
+            matches = float(int(t1_idx.item()) == move_idx)
+            safe_p = torch.clamp(probs, min=1e-12)
+            ent = float(
+                -torch.sum(
+                    torch.where(legal_1d > 0.5, probs * torch.log(safe_p), torch.zeros_like(probs))
+                ).item()
+            )
+            if elo_val == 1500:
+                top1_prob_1500 = float(t1_prob.item())
+                top1_match_1500 = matches
+                entropy_1500 = ent
+                rank_1500 = float((probs > sol_p).sum().item() + 1.0)
+            else:
+                top1_match_1900 = matches
+                entropy_1900 = ent
 
     p1100, p1300, p1500, p1700, p1900 = probs_per_elo
     return {
@@ -234,70 +268,48 @@ def compute_maia2_p1_live(puzzle_fen: str, sol_move_uci: str) -> dict:
 
 
 def compute_maia2_p3_live(ply3_fen: str | None, sol2_uci: str | None) -> dict:
+    default_p3 = {
+        "has_ply3": 0.0,
+        "maia_p3_prob_1100": 1.0,
+        "maia_p3_prob_1500": 1.0,
+        "maia_p3_prob_1900": 1.0,
+        "maia_p3_top1_match_1500": 1.0,
+        "maia_p3_rank_1500": 1.0,
+        "maia_p3_entropy_1500": 0.0,
+    }
     if not ply3_fen or not sol2_uci:
-        return {
-            "has_ply3": 0.0,
-            "maia_p3_prob_1100": 1.0,
-            "maia_p3_prob_1500": 1.0,
-            "maia_p3_prob_1900": 1.0,
-            "maia_p3_top1_match_1500": 1.0,
-            "maia_p3_rank_1500": 1.0,
-            "maia_p3_entropy_1500": 0.0,
-        }
+        return default_p3
 
-    rt = _get_maia2_runtime()
-    torch, m2_inf, device = rt["torch"], rt["m2_inf"], rt["device"]
-    all_moves_dict, elo_dict, maia_net = rt["all_moves_dict"], rt["elo_dict"], rt["model"]
+    rt = _get_maia2_runtime(need_blitz=False)
+    torch, m2_inf, maia_net = rt["torch"], rt["m2_inf"], rt["model"]
+    all_moves_dict = rt["all_moves_dict"]
 
     board = chess.Board(ply3_fen)
     mirrored_sol = m2_inf.mirror_move(sol2_uci) if board.turn == chess.BLACK else sol2_uci
     move_idx = all_moves_dict.get(mirrored_sol, -1)
     if move_idx < 0:
-        return {
-            "has_ply3": 0.0,
-            "maia_p3_prob_1100": 1.0,
-            "maia_p3_prob_1500": 1.0,
-            "maia_p3_prob_1900": 1.0,
-            "maia_p3_top1_match_1500": 1.0,
-            "maia_p3_rank_1500": 1.0,
-            "maia_p3_entropy_1500": 0.0,
-        }
-
-    board_input, _, _, legal_mask = m2_inf.preprocessing(
-        ply3_fen, 1500, 1500, elo_dict, all_moves_dict
-    )
-    boards_t = board_input.unsqueeze(0).to(device)
-    legal_t = legal_mask.unsqueeze(0).float().to(device)
-    neg_inf = torch.tensor(-1e4, device=device, dtype=torch.float32)
+        return default_p3
 
     probs_per_elo = []
     top1_match_1500 = 0.0
     rank_1500 = 1.0
     entropy_1500 = 0.0
 
-    with torch.inference_mode():
-        for elo_val in ELO_LEVELS_P3:
-            elo_cat = m2_inf.map_to_category(elo_val, elo_dict)
-            elo_t = torch.tensor([elo_cat], dtype=torch.long, device=device)
-            out = maia_net(boards_t, elo_t, elo_t)
-            logits = (out[0] if isinstance(out, (tuple, list)) else out).float()
-            masked_logits = torch.where(legal_t > 0.5, logits, neg_inf)
-            probs = torch.softmax(masked_logits, dim=-1)
+    for elo_val in ELO_LEVELS_P3:
+        probs, legal_1d = _eval_single_board_probs(maia_net, rt, ply3_fen, elo_val)
+        sol_p = float(probs[move_idx].item())
+        probs_per_elo.append(sol_p)
 
-            sol_p = float(probs[0, move_idx].item())
-            probs_per_elo.append(sol_p)
-
-            if elo_val == 1500:
-                _, t1_idx = probs.max(dim=-1)
-                top1_match_1500 = float(int(t1_idx.item()) == move_idx)
-                rank_1500 = float((probs[0] > sol_p).sum().item() + 1.0)
-                safe_p = torch.clamp(probs, min=1e-12)
-                entropy_1500 = float(
-                    -torch.sum(
-                        torch.where(legal_t > 0.5, probs * torch.log(safe_p), torch.zeros_like(probs)),
-                        dim=-1,
-                    ).item()
-                )
+        if elo_val == 1500:
+            _, t1_idx = probs.max(dim=-1)
+            top1_match_1500 = float(int(t1_idx.item()) == move_idx)
+            rank_1500 = float((probs > sol_p).sum().item() + 1.0)
+            safe_p = torch.clamp(probs, min=1e-12)
+            entropy_1500 = float(
+                -torch.sum(
+                    torch.where(legal_1d > 0.5, probs * torch.log(safe_p), torch.zeros_like(probs))
+                ).item()
+            )
 
     return {
         "has_ply3": 1.0,
@@ -307,6 +319,90 @@ def compute_maia2_p3_live(ply3_fen: str | None, sol2_uci: str | None) -> dict:
         "maia_p3_top1_match_1500": top1_match_1500,
         "maia_p3_rank_1500": rank_1500,
         "maia_p3_entropy_1500": entropy_1500,
+    }
+
+
+def compute_maia2_v4_live(
+    puzzle_fen: str,
+    sol1_uci: str,
+    ply2_fen: str | None,
+    opp1_uci: str | None,
+    ply5_fen: str | None,
+    sol3_uci: str | None,
+) -> dict:
+    rt = _get_maia2_runtime(need_blitz=True)
+    torch, m2_inf = rt["torch"], rt["m2_inf"]
+    rapid_net, blitz_net = rt["model"], rt["blitz_model"]
+    all_moves_dict = rt["all_moves_dict"]
+
+    b1 = chess.Board(puzzle_fen)
+    m1 = m2_inf.mirror_move(sol1_uci) if b1.turn == chess.BLACK else sol1_uci
+    idx1 = all_moves_dict[m1]
+
+    p1_r1900, _ = _eval_single_board_probs(rapid_net, rt, puzzle_fen, 1900)
+    p1_b1500, _ = _eval_single_board_probs(blitz_net, rt, puzzle_fen, 1500)
+    p1_b1900, _ = _eval_single_board_probs(blitz_net, rt, puzzle_fen, 1900)
+
+    sol_r1900 = float(p1_r1900[idx1].item())
+    top2_vals, top2_idxs = torch.topk(p1_r1900, k=2)
+    top1_r1900 = float(top2_vals[0].item())
+    top2_r1900 = float(top2_vals[1].item())
+    gap_r1900 = top1_r1900 - top2_r1900
+    rank_r1900 = float((p1_r1900 > sol_r1900).sum().item() + 1.0)
+    ratio_r1900 = sol_r1900 / max(top1_r1900, 1e-6)
+
+    sol_b1500 = float(p1_b1500[idx1].item())
+    sol_b1900 = float(p1_b1900[idx1].item())
+    rapid_minus_blitz = sol_r1900 - sol_b1900
+    b_t1_prob, b_t1_idx = p1_b1900.max(dim=-1)
+    blitz_trap_gap = float(b_t1_prob.item()) - sol_b1900
+    top1_agree = float(int(top2_idxs[0].item()) == int(b_t1_idx.item()))
+
+    opp_ent_1900, opp_top1_1900, opp_sol_1900 = 0.0, 1.0, 1.0
+    if ply2_fen and opp1_uci:
+        b2 = chess.Board(ply2_fen)
+        m2 = m2_inf.mirror_move(opp1_uci) if b2.turn == chess.BLACK else opp1_uci
+        idx2 = all_moves_dict.get(m2, -1)
+        if idx2 >= 0:
+            p2_probs, l2_1d = _eval_single_board_probs(rapid_net, rt, ply2_fen, 1900)
+            safe_p2 = torch.clamp(p2_probs, min=1e-12)
+            opp_ent_1900 = float(
+                -torch.sum(torch.where(l2_1d > 0.5, p2_probs * torch.log(safe_p2), torch.zeros_like(p2_probs))).item()
+            )
+            opp_top1_1900 = float(p2_probs.max().item())
+            opp_sol_1900 = float(p2_probs[idx2].item())
+
+    has_ply5, p5_1500, p5_1900, p5_rank_1900 = 0.0, 1.0, 1.0, 1.0
+    if ply5_fen and sol3_uci:
+        b5 = chess.Board(ply5_fen)
+        m5 = m2_inf.mirror_move(sol3_uci) if b5.turn == chess.BLACK else sol3_uci
+        idx5 = all_moves_dict.get(m5, -1)
+        if idx5 >= 0:
+            probs5_1500, _ = _eval_single_board_probs(rapid_net, rt, ply5_fen, 1500)
+            probs5_1900, _ = _eval_single_board_probs(rapid_net, rt, ply5_fen, 1900)
+            has_ply5 = 1.0
+            p5_1500 = float(probs5_1500[idx5].item())
+            p5_1900 = float(probs5_1900[idx5].item())
+            p5_rank_1900 = float((probs5_1900 > p5_1900).sum().item() + 1.0)
+
+    return {
+        "maia_top1_prob_1900": top1_r1900,
+        "maia_top2_prob_1900": top2_r1900,
+        "maia_top1_top2_gap_1900": gap_r1900,
+        "maia_move_rank_1900": rank_r1900,
+        "maia_prob_ratio_1900": ratio_r1900,
+        "maia_blitz_prob_1500": sol_b1500,
+        "maia_blitz_prob_1900": sol_b1900,
+        "maia_rapid_minus_blitz_1900": rapid_minus_blitz,
+        "maia_blitz_trap_gap_1900": blitz_trap_gap,
+        "maia_blitz_rapid_top1_agree": top1_agree,
+        "opp_p2_entropy_1900": opp_ent_1900,
+        "opp_p2_top1_prob_1900": opp_top1_1900,
+        "opp_p2_sol_prob_1900": opp_sol_1900,
+        "has_ply5": has_ply5,
+        "maia_p5_prob_1500": p5_1500,
+        "maia_p5_prob_1900": p5_1900,
+        "maia_p5_rank_1900": p5_rank_1900,
     }
 
 
@@ -327,6 +423,31 @@ def add_v3_interactions_dict(feat_dict: dict) -> None:
     feat_dict["maia_p3_log_prob_1900"] = float(np.log(np.clip(p3_1900, 1e-6, 1.0)))
     feat_dict["maia_p3_slope"] = p3_1900 - p3_1100
     feat_dict["maia_rank_sum_1500"] = r1_1500 + (r3_1500 - 1.0) * has_p3
+
+
+def add_v4_interactions_dict(feat_dict: dict) -> None:
+    p1_1900 = float(feat_dict["maia_prob_1900"])
+    p3_1900 = float(feat_dict["maia_p3_prob_1900"])
+    p5_1900 = float(feat_dict["maia_p5_prob_1900"])
+    has_p3 = float(feat_dict["has_ply3"])
+    has_p5 = float(feat_dict["has_ply5"])
+
+    r1_1900 = float(feat_dict["maia_move_rank_1900"])
+    r3_1900 = max(1.0, float(feat_dict["maia_p3_rank_1500"]) * 0.75)
+    r5_1900 = float(feat_dict["maia_p5_rank_1900"])
+
+    blitz_trap = float(feat_dict["maia_blitz_trap_gap_1900"])
+    top1_match_1900 = float(feat_dict["maia_top1_matches_1900"])
+    opp_ent = float(feat_dict["opp_p2_entropy_1900"])
+    opp_sol = float(feat_dict["opp_p2_sol_prob_1900"])
+
+    full_chain = p1_1900 * p3_1900 * p5_1900
+    feat_dict["maia_full_chain_prob_1900"] = full_chain
+    feat_dict["maia_full_chain_log_1900"] = float(np.log(np.clip(full_chain, 1e-9, 1.0)))
+    feat_dict["maia_min_chain_prob_1900"] = min(p1_1900, p3_1900, p5_1900)
+    feat_dict["maia_rank_sum_1900"] = r1_1900 + (r3_1900 - 1.0) * has_p3 + (r5_1900 - 1.0) * has_p5
+    feat_dict["maia_trap_severity_1900"] = blitz_trap * (1.0 - top1_match_1900)
+    feat_dict["maia_calc_burden_1900"] = (1.0 - opp_sol) * opp_ent
 
 
 def fetch_table_row_dict(table_name: str, cols: list[str], puzzle_id: str | None) -> dict | None:
@@ -394,6 +515,10 @@ class PuzzleDifficultyPredictor:
     def __init__(self, model_dir: str | Path | None = None):
         if model_dir is not None:
             self.model_dir = Path(model_dir)
+        elif Path("models_v4").exists():
+            self.model_dir = Path("models_v4")
+        elif Path("models_v3_1").exists():
+            self.model_dir = Path("models_v3_1")
         elif Path("models_v3_full").exists():
             self.model_dir = Path("models_v3_full")
         elif Path("models_hybrid_maia2").exists():
@@ -403,11 +528,18 @@ class PuzzleDifficultyPredictor:
         else:
             self.model_dir = Path("models")
 
-        self.is_v3 = (self.model_dir / "lgb_v3.joblib").exists()
+        self.is_v4 = (self.model_dir / "lgb_v4.joblib").exists()
+        self.is_v3 = (self.model_dir / "lgb_v3.joblib").exists() or self.is_v4
         self.is_v2 = (self.model_dir / "lgb_hybrid.joblib").exists()
         self.is_hybrid = self.is_v3 or self.is_v2
 
-        if self.is_v3:
+        if self.is_v4:
+            self.lgb_model = joblib.load(self.model_dir / "lgb_v4.joblib")
+            self.xgb_model = xgb.XGBRegressor()
+            self.xgb_model.load_model(str(self.model_dir / "xgb_v4.json"))
+            self.cat_model = CatBoostRegressor()
+            self.cat_model.load_model(str(self.model_dir / "cat_v4.cbm"))
+        elif self.is_v3:
             self.lgb_model = joblib.load(self.model_dir / "lgb_v3.joblib")
             self.xgb_model = xgb.XGBRegressor()
             self.xgb_model.load_model(str(self.model_dir / "xgb_v3.json"))
@@ -435,8 +567,10 @@ class PuzzleDifficultyPredictor:
             with open(self.model_dir / "residual_meta.json", "r", encoding="utf-8") as f:
                 r_meta = json.load(f)
             self.alpha = float(r_meta["alpha"])
-            self.calibrator_type = "Ridge"
+            self.calibrator_type = r_meta.get("calibrator_type", "Ridge")
             self.uncertainty_scale = 8.0
+            unc_path = self.model_dir / "uncertainty_models.joblib"
+            self.uncertainty_models = joblib.load(unc_path) if unc_path.exists() else None
         else:
             self.lgb_model = lgb.Booster(model_file=str(self.model_dir / "lgb_model.txt"))
             self.xgb_model = xgb.XGBRegressor()
@@ -455,6 +589,7 @@ class PuzzleDifficultyPredictor:
             self.calibrator_type = stage2["calibrator_type"]
             self.calibrator = stage2["calibrator"]
             self.uncertainty_scale = stage2["uncertainty_scale"]
+            self.uncertainty_models = None
 
     def extract_features_and_states(self, fen: str, moves_raw: str, puzzle_id: str | None = None):
         moves = parse_moves_sequence(fen, moves_raw)
@@ -482,8 +617,12 @@ class PuzzleDifficultyPredictor:
 
         puzzle_start_fen = board.fen()
         first_solution_uci = moves[1].uci()
+        ply2_fen = None
+        first_opp_uci = moves[2].uci() if len(moves) >= 3 else None
         ply3_fen = None
         second_solution_uci = moves[3].uci() if len(moves) >= 4 else None
+        ply5_fen = None
+        third_solution_uci = moves[5].uci() if len(moves) >= 6 else None
 
         states.append(
             {
@@ -616,6 +755,8 @@ class PuzzleDifficultyPredictor:
                 )
                 opp_legal_moves_ply2 = board.legal_moves.count()
                 opp_is_forced_ply2 = int(opp_legal_moves_ply2 == 1)
+                if solution_ply >= 2:
+                    ply2_fen = board.fen()
 
             if idx == 1:
                 _, _, _, _, s_mat_mid, _ = _material_and_counts(board, solver_color)
@@ -628,6 +769,9 @@ class PuzzleDifficultyPredictor:
 
             if idx == 2:
                 second_solver_move_is_quiet = int(is_quiet)
+
+            if idx == 3 and solution_ply >= 5:
+                ply5_fen = board.fen()
 
             if is_solver_turn:
                 solver_checks += int(is_chk)
@@ -719,6 +863,20 @@ class PuzzleDifficultyPredictor:
             feat_dict.update(m3_feats)
             add_v3_interactions_dict(feat_dict)
 
+        if self.is_v4:
+            m4_feats = fetch_table_row_dict("maia2_v4_features", MAIA2_V4_COLS, puzzle_id)
+            if m4_feats is None:
+                m4_feats = compute_maia2_v4_live(
+                    puzzle_start_fen,
+                    first_solution_uci,
+                    ply2_fen,
+                    first_opp_uci,
+                    ply5_fen,
+                    third_solution_uci,
+                )
+            feat_dict.update(m4_feats)
+            add_v4_interactions_dict(feat_dict)
+
         X = np.array([[feat_dict[col] for col in self.feature_cols]], dtype=np.float32)
         return X, feat_dict, states, solver_color
 
@@ -772,12 +930,26 @@ class PuzzleDifficultyPredictor:
         res_pred = float(np.mean([m.predict(X_meta)[0] for m in self.residual_models]))
         p_after_res = p_ens + self.alpha * res_pred
 
-        if self.calibrator_type == "İzotonik Kalibrasyon":
+        if isinstance(self.calibrator, list):
+            if self.calibrator_type == "BaggedSplineRidge":
+                p_final = float(
+                    np.mean([cal.predict([[p_after_res]])[0] for cal in self.calibrator])
+                )
+            else:
+                p_final = float(
+                    np.mean([iso.predict([p_after_res])[0] for iso in self.calibrator])
+                )
+        elif self.calibrator_type == "İzotonik Kalibrasyon":
             p_final = float(self.calibrator.predict([p_after_res])[0])
         else:
             p_final = float(self.calibrator.predict([[p_after_res]])[0])
 
-        if self.is_hybrid:
+        if self.is_hybrid and getattr(self, "uncertainty_models", None) is not None:
+            pred_log_var = float(np.mean([um.predict(X_meta)[0] for um in self.uncertainty_models]))
+            expected_margin = float(
+                np.clip(np.sqrt(max(np.exp(pred_log_var) - 2500.0, 6400.0)), 85.0, 460.0)
+            )
+        elif self.is_hybrid:
             uncertainty_raw = pred_std + 0.35 * abs(res_pred)
             expected_margin = float(np.clip(105.0 + uncertainty_raw * self.uncertainty_scale, 105.0, 440.0))
         else:
@@ -792,6 +964,7 @@ class PuzzleDifficultyPredictor:
             "solver_color": "Beyaz" if solver_color == chess.WHITE else "Siyah",
             "is_hybrid": self.is_hybrid,
             "is_v3": self.is_v3,
+            "is_v4": self.is_v4,
             "models": {
                 "LightGBM": round(p_lgb, 1),
                 "XGBoost": round(p_xgb, 1),

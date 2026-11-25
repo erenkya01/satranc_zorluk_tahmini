@@ -91,12 +91,20 @@ def main():
     st.title("♟️ Satranç Bulmacalarının Zorluk Derecesi Tahmin Sistemi")
     st.caption(
         "Sivas Cumhuriyet Üniversitesi Bilgisayar Mühendisliği Bitirme Projesi | "
-        "Çok Adımlı Maia-2 İnsan Politikası + 84 Öznitelikli Hibrit GBDT + Artık Öğrenme"
+        "Çok Adımlı Maia-2 (Rapid & Blitz) Bilişsel Politikası + 107 Öznitelikli Hibrit GBDT + Artık Öğrenme"
     )
 
     with st.sidebar:
         st.header("Model Mimarisi Seçimi")
         model_options = {}
+        if (ROOT_DIR / "models_v4").exists():
+            model_options["v4: Tam Bilişsel & Derin Varyant (107 Özellik | Blitz/Rapid + Ply 1/3/5)"] = str(
+                ROOT_DIR / "models_v4"
+            )
+        if (ROOT_DIR / "models_v3_1").exists():
+            model_options["v3.1: Stabilize Hibrit (84 Özellik + RD Ağırlıklı | 241.1 RMSE)"] = str(
+                ROOT_DIR / "models_v3_1"
+            )
         if (ROOT_DIR / "models_v3_full").exists():
             model_options["v3: Tam Hibrit (84 Özellik + Ply 1&3 Maia-2 | 241.4 RMSE)"] = str(
                 ROOT_DIR / "models_v3_full"
@@ -109,6 +117,10 @@ def main():
             model_options["v1: Saf Yapısal (56 Özellik | 282.7 RMSE)"] = str(
                 ROOT_DIR / "models_structural_only"
             )
+
+        if not model_options:
+            st.error("Eğitilmiş model klasörü bulunamadı!")
+            return
 
         selected_model_label = st.selectbox(
             "Aktif Tahmin Modeli:",
@@ -272,16 +284,55 @@ def main():
         if result["is_hybrid"] and "maia_prob_1500" in feats:
             st.subheader("Maia-2 İnsan Politikası Analizi")
             maia_rows = [
-                ("1. Hamle (Ply 1) İnsan Olasılığı (1500 Elo)", f"%{feats['maia_prob_1500'] * 100:.1f} (Sıra: {int(feats['maia_move_rank_1500'])})"),
-                ("1. Hamle (Ply 1) Usta Olasılığı (1900 Elo)", f"%{feats['maia_prob_1900'] * 100:.1f}"),
+                (
+                    "1. Hamle (Ply 1) İnsan Olasılığı (1500 Elo)",
+                    f"%{feats['maia_prob_1500'] * 100:.1f} (Sıra: {int(feats['maia_move_rank_1500'])})",
+                ),
+                (
+                    "1. Hamle (Ply 1) Usta Olasılığı (1900 Elo)",
+                    f"%{feats['maia_prob_1900'] * 100:.1f}",
+                ),
             ]
+
             if result.get("is_v3") and feats.get("has_ply3", 0.0) >= 0.5:
                 maia_rows.extend(
                     [
-                        ("2. Hamle (Ply 3) İnsan Olasılığı (1500 Elo)", f"%{feats['maia_p3_prob_1500'] * 100:.1f} (Sıra: {int(feats['maia_p3_rank_1500'])})"),
-                        ("Zincirleme Bulunma Olasılığı (Ply 1 × Ply 3)", f"%{feats['maia_chain_prob_1500'] * 100:.1f}"),
+                        (
+                            "2. Hamle (Ply 3) İnsan Olasılığı (1500 Elo)",
+                            f"%{feats['maia_p3_prob_1500'] * 100:.1f} (Sıra: {int(feats['maia_p3_rank_1500'])})",
+                        ),
+                        (
+                            "Zincirleme Bulunma Olasılığı (Ply 1 × Ply 3)",
+                            f"%{feats['maia_chain_prob_1500'] * 100:.1f}",
+                        ),
                     ]
                 )
+
+            if result.get("is_v4"):
+                maia_rows.extend(
+                    [
+                        (
+                            "Rapid − Blitz Bilişsel Farkı (1900 Elo)",
+                            f"{feats['maia_rapid_minus_blitz_1900'] * 100:+.1f} puan",
+                        ),
+                        (
+                            "Blitz Tuzak Sapması (Top-1 − Çözüm)",
+                            f"%{feats['maia_blitz_trap_gap_1900'] * 100:.1f}",
+                        ),
+                        (
+                            "Rakip Savunma Dallanma Entropisi (Ply 2)",
+                            f"{feats['opp_p2_entropy_1900']:.2f} nat",
+                        ),
+                    ]
+                )
+                if feats.get("has_ply5", 0.0) >= 0.5:
+                    maia_rows.append(
+                        (
+                            "3. Hamle (Ply 5) Usta Olasılığı (1900 Elo)",
+                            f"%{feats['maia_p5_prob_1900'] * 100:.1f} (Sıra: {int(feats['maia_p5_rank_1900'])})",
+                        )
+                    )
+
             maia_rows.extend(
                 [
                     ("Yetenek Ayrım Eğimi (1900 − 1100)", f"{feats['maia_prob_slope'] * 100:+.1f} puan"),
@@ -296,7 +347,12 @@ def main():
         drivers = [
             ("Başlangıç Yasal Hamle Sayısı (Dallanma)", f"{feats['legal_moves_start']} hamle"),
             ("Çözüm Uzunluğu", f"{feats['solver_moves_count']} çözücü hamlesi ({feats['solution_ply']} ply)"),
-            ("İlk Hamle Karakteri", "Sessiz Hamle (Quiet)" if feats["first_move_is_quiet"] else ("Şah Çekiş" if feats["first_move_is_check"] else "Taş Alma")),
+            (
+                "İlk Hamle Karakteri",
+                "Sessiz Hamle (Quiet)"
+                if feats["first_move_is_quiet"]
+                else ("Şah Çekiş" if feats["first_move_is_check"] else "Taş Alma"),
+            ),
             ("İlk Hamle Taşı ve Mesafesi", f"{piece_name} ({feats['first_move_dist']} kare Manhattan)"),
             ("Taş Fedası (Sacrifice)", "Evet" if feats["is_sacrifice"] else "Hayır"),
             ("Mat ile Bitiş", "Evet" if feats["ends_in_mate"] else "Hayır"),

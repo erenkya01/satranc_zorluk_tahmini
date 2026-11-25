@@ -10,6 +10,8 @@ models_structural_only/
 models_hybrid_maia2/
 models_v3_full/
 maia2_models/
+models_v3_1/
+models_v4/
 *.npz
 *.joblib
 *.cbm

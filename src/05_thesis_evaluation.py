@@ -1,4 +1,6 @@
 import json
+import sqlite3
+import sys
 from pathlib import Path
 
 import joblib
@@ -9,18 +11,25 @@ from scipy.stats import pearsonr, spearmanr
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from tqdm import tqdm
 
-from inference import PuzzleDifficultyPredictor
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
-V1_DIR = Path("models_structural_only")
-V2_DIR = Path("models_hybrid_maia2")
-V3_DIR = Path("models_v3_full")
+from src.inference import PuzzleDifficultyPredictor
+
+DB_PATH = ROOT_DIR / "data" / "puzzles.db"
+V1_DIR = ROOT_DIR / "models_structural_only"
+V2_DIR = ROOT_DIR / "models_hybrid_maia2"
+V3_DIR = ROOT_DIR / "models_v3_full"
+V31_DIR = ROOT_DIR / "models_v3_1"
+V4_DIR = ROOT_DIR / "models_v4"
 
 COMP_CSV_CANDIDATES = [
-    Path("data") / "testing_data_cropped.csv",
-    Path("testing_data_cropped.csv"),
+    ROOT_DIR / "testing_data_cropped.csv",
+    ROOT_DIR / "data" / "testing_data_cropped.csv",
 ]
 
-OUT_DIR = Path("reports")
+OUT_DIR = ROOT_DIR / "reports"
 FIG_DIR = OUT_DIR / "figures"
 TBL_DIR = OUT_DIR / "tables"
 
@@ -47,6 +56,27 @@ TIERS = [
     ("Usta Seviyesi (2300+)", 2300, 4000),
 ]
 
+TARGET_THEMES = [
+    ("mateIn1", "1 Hamlede Mat (Mate in 1)"),
+    ("mateIn2", "2 Hamlede Mat (Mate in 2)"),
+    ("mateIn3", "3+ Hamlede Mat (Mate in 3+)"),
+    ("fork", "Çatal (Fork)"),
+    ("pin", "Açmaz (Pin)"),
+    ("skewer", "Şiş (Skewer)"),
+    ("discoveredAttack", "Açarak Saldırı (Discovered Attack)"),
+    ("hangingPiece", "Boşta Taş (Hanging Piece)"),
+    ("sacrifice", "Taş Fedası (Sacrifice)"),
+    ("quietMove", "Sessiz Hamle (Quiet Move)"),
+    ("zugzwang", "Zugzwang"),
+    ("deflection", "Saptırma (Deflection)"),
+    ("attraction", "Cezbetme (Attraction)"),
+    ("endgame", "Oyun Sonu (Endgame)"),
+    ("middlegame", "Oyun Ortası (Middlegame)"),
+    ("opening", "Açılış (Opening)"),
+    ("crushing", "Ezici Üstünlük (Crushing)"),
+    ("advantage", "Konumsal Üstünlük (Advantage)"),
+]
+
 
 def build_meta_features(p_lgb, p_xgb, p_cat, p_ens, context):
     stack3 = np.column_stack([p_lgb, p_xgb, p_cat])
@@ -65,11 +95,11 @@ def build_meta_features(p_lgb, p_xgb, p_cat, p_ens, context):
             p_xgb - p_cat,
         ]
     ).astype(np.float32)
-    return np.hstack([base_meta, context.astype(np.float32)]), pred_std
+    return np.hstack([base_meta, context.astype(np.float32)])
 
 
-def load_v3_test_predictions():
-    arr = np.load(V3_DIR / "v3_oof_and_test.npz")
+def load_v4_test_predictions():
+    arr = np.load(V4_DIR / "v4_oof_and_test.npz")
     y_test = arr["y_test"].astype(np.float32)
     test_lgb = arr["test_lgb"].astype(np.float32)
     test_xgb = arr["test_xgb"].astype(np.float32)
@@ -77,19 +107,22 @@ def load_v3_test_predictions():
     test_ens = arr["test_ens"].astype(np.float32)
     test_context = arr["test_context"].astype(np.float32)
 
-    res_models = joblib.load(V3_DIR / "residual_models.joblib")
-    calibrator = joblib.load(V3_DIR / "calibrator.joblib")
-    with open(V3_DIR / "residual_meta.json", "r", encoding="utf-8") as f:
+    res_models = joblib.load(V4_DIR / "residual_models.joblib")
+    calibrators = joblib.load(V4_DIR / "calibrator.joblib")
+    unc_models = joblib.load(V4_DIR / "uncertainty_models.joblib")
+    with open(V4_DIR / "residual_meta.json", "r", encoding="utf-8") as f:
         alpha = float(json.load(f)["alpha"])
 
-    X_meta_test, pred_std = build_meta_features(
+    X_meta_test = build_meta_features(
         test_lgb, test_xgb, test_cat, test_ens, test_context
     )
     res_pred = np.mean([m.predict(X_meta_test) for m in res_models], axis=0).astype(np.float32)
-    p_after_res = test_ens + alpha * res_pred
-    p_final = calibrator.predict(p_after_res.reshape(-1, 1)).astype(np.float32)
-    uncertainty = pred_std + 0.35 * np.abs(res_pred)
-    return y_test, test_ens, p_final, uncertainty
+    p_after_res = (test_ens + alpha * res_pred).reshape(-1, 1)
+    p_final = np.mean([cal.predict(p_after_res) for cal in calibrators], axis=0).astype(np.float32)
+
+    pred_log_var = np.mean([um.predict(X_meta_test) for um in unc_models], axis=0)
+    pred_sigma = np.sqrt(np.maximum(np.exp(pred_log_var) - 2500.0, 6400.0)).astype(np.float32)
+    return y_test, test_ens, p_final, pred_sigma
 
 
 def compute_competition_metrics(y_true: np.ndarray, y_pred: np.ndarray, uncertainty: np.ndarray) -> dict:
@@ -163,57 +196,113 @@ def compute_stratified_table(y_true: np.ndarray, y_pred: np.ndarray) -> pd.DataF
     return pd.DataFrame(rows)
 
 
+def compute_theme_error_table(y_true: np.ndarray, y_pred: np.ndarray) -> pd.DataFrame | None:
+    if not DB_PATH.exists():
+        return None
+    conn = sqlite3.connect(DB_PATH)
+    df_meta = pd.read_sql_query(
+        """
+        SELECT r.rating, r.themes
+        FROM structural_features sf
+        INNER JOIN maia2_features m1 ON sf.puzzle_id = m1.puzzle_id
+        INNER JOIN maia2_ply3_features m3 ON sf.puzzle_id = m3.puzzle_id
+        INNER JOIN maia2_v4_features m4 ON sf.puzzle_id = m4.puzzle_id
+        INNER JOIN raw_puzzles r ON sf.puzzle_id = r.puzzle_id
+        WHERE LOWER(r.split) = 'test'
+        ORDER BY sf.puzzle_id
+        """,
+        conn,
+    )
+    conn.close()
+
+    if len(df_meta) != len(y_true) or not np.array_equal(df_meta["rating"].to_numpy(), y_true.astype(int)):
+        return None
+
+    themes_series = df_meta["themes"].fillna("").astype(str)
+    rows = []
+    for tag, label_tr in TARGET_THEMES:
+        mask = themes_series.str.contains(rf"\b{tag}\b", regex=True).to_numpy()
+        cnt = int(np.sum(mask))
+        if cnt < 100:
+            continue
+        yt = y_true[mask]
+        yp = y_pred[mask]
+        rows.append(
+            {
+                "Taktik_Tema": label_tr,
+                "Etiket": tag,
+                "Bulmaca_Sayisi": cnt,
+                "Gercek_Ort_Elo": round(float(np.mean(yt)), 1),
+                "Tahmin_Ort_Elo": round(float(np.mean(yp)), 1),
+                "Sapma_Bias": round(float(np.mean(yp - yt)), 1),
+                "RMSE": round(float(np.sqrt(mean_squared_error(yt, yp))), 2),
+                "MAE": round(float(mean_absolute_error(yt, yp)), 2),
+            }
+        )
+    return pd.DataFrame(rows).sort_values("RMSE", ascending=True)
+
+
 def evaluate_competition_blind_csv(csv_path: Path | None) -> pd.DataFrame | None:
     if csv_path is None or not csv_path.exists():
         return None
 
     df = pd.read_csv(csv_path)
-    sub_path = OUT_DIR / "competition_submission_v3.csv"
+    sub_path = OUT_DIR / "competition_submission_v4.csv"
+    ext_v4_path = V4_DIR / "external_validation_v4.csv"
 
     used_cache = False
     if sub_path.exists():
         sub_df = pd.read_csv(sub_path)
         if len(sub_df) == len(df):
-            for col in ["predicted_rating", "ci_low", "ci_high", "uncertainty_score", "keep_90pct_mask"]:
+            for col in ["predicted_rating", "ci_low", "ci_high", "expected_margin", "keep_90pct_mask"]:
                 df[col] = sub_df[col]
             df["solution_ply"] = df["Moves"].str.split().str.len() - 1
             used_cache = True
-            print(f"\n[Bölüm B] Önceden hesaplanan yarışma tahminleri '{sub_path}' dosyasından yüklendi.")
+            print(f"\n[Bölüm B] Önceden hesaplanan v4 yarışma tahminleri '{sub_path.name}' dosyasından yüklendi.")
+    elif ext_v4_path.exists():
+        ext_df = pd.read_csv(ext_v4_path)
+        if len(ext_df) == len(df) and "pred_rating" in ext_df.columns:
+            df["predicted_rating"] = ext_df["pred_rating"]
+            df["expected_margin"] = ext_df["expected_margin"]
+            df["ci_low"] = (df["predicted_rating"] - df["expected_margin"]).round().astype(int)
+            df["ci_high"] = (df["predicted_rating"] + df["expected_margin"]).round().astype(int)
+            q90 = float(np.quantile(df["expected_margin"], 0.90))
+            df["keep_90pct_mask"] = (df["expected_margin"] <= q90).astype(int)
+            df["solution_ply"] = df["Moves"].str.split().str.len() - 1
+            df[["PuzzleId", "predicted_rating", "ci_low", "ci_high", "expected_margin", "keep_90pct_mask"]].to_csv(
+                sub_path, index=False
+            )
+            used_cache = True
+            print(f"\n[Bölüm B] '{ext_v4_path.name}' içindeki v4 tahminleri yeniden kullanıldı.")
 
     if not used_cache:
-        predictor = PuzzleDifficultyPredictor(model_dir=V3_DIR)
-        preds, ci_lows, ci_highs, uncertainties, plies = [], [], [], [], []
+        predictor = PuzzleDifficultyPredictor(model_dir=V4_DIR)
+        preds, ci_lows, ci_highs, margins, plies = [], [], [], [], []
 
-        print(f"\n[Bölüm B] Yarışma kör test dosyası ({csv_path.name}, N={len(df):,}) v3 ile değerlendiriliyor...")
-        for row in tqdm(df.itertuples(index=False), total=len(df), unit="bulmaca", desc="FedCSIS Blind Test"):
+        print(f"\n[Bölüm B] Yarışma kör test dosyası ({csv_path.name}, N={len(df):,}) v4 ile değerlendiriliyor...")
+        for row in tqdm(df.itertuples(index=False), total=len(df), unit="bulmaca", desc="FedCSIS v4 Blind Test"):
             res = predictor.predict(row.FEN, row.Moves, puzzle_id=None)
-            m = res["models"]
-            p3 = np.array([m["LightGBM"], m["XGBoost"], m["CatBoost"]], dtype=np.float32)
-            pred_std = float(np.std(p3))
-            res_corr = abs(float(m["Artık Düzeltme (Residual)"])) / max(predictor.alpha, 1e-6)
-            unc = pred_std + 0.35 * res_corr
-
-            preds.append(float(m["Nihai Tahmin (Kalibreli)"]))
+            preds.append(float(res["models"]["Nihai Tahmin (Kalibreli)"]))
             ci_lows.append(res["ci_low"])
             ci_highs.append(res["ci_high"])
-            uncertainties.append(unc)
+            margins.append(float(res["expected_margin"]))
             plies.append(int(res["features"]["solution_ply"]))
 
         df["predicted_rating"] = np.round(preds, 1)
         df["ci_low"] = ci_lows
         df["ci_high"] = ci_highs
-        df["uncertainty_score"] = np.round(uncertainties, 3)
+        df["expected_margin"] = np.round(margins, 1)
         df["solution_ply"] = plies
 
-        q90 = float(np.quantile(df["uncertainty_score"], 0.90))
-        df["keep_90pct_mask"] = (df["uncertainty_score"] <= q90).astype(int)
+        q90 = float(np.quantile(df["expected_margin"], 0.90))
+        df["keep_90pct_mask"] = (df["expected_margin"] <= q90).astype(int)
 
         sub_cols = [
             "PuzzleId",
             "predicted_rating",
             "ci_low",
             "ci_high",
-            "uncertainty_score",
+            "expected_margin",
             "keep_90pct_mask",
         ]
         df[sub_cols].to_csv(sub_path, index=False)
@@ -251,59 +340,63 @@ def evaluate_competition_blind_csv(csv_path: Path | None) -> pd.DataFrame | None
     mid_mae = float(mean_absolute_error(implied_elos, pred_mid))
     mid_r, _ = pearsonr(implied_elos, pred_mid)
 
-    print("\n================ FEDCSIS 2025 KÖR TEST DOĞRULAMASI (N = 2.235) ================")
+    print("\n================ FEDCSIS 2025 KÖR TEST DOĞRULAMASI (v4 | N = 2.235) ================")
     print(f"Çok hamleli (solution_ply >= 3) oranı : %{(df['solution_ply'] >= 3).mean() * 100:.1f} ({(df['solution_ply'] >= 3).sum()}/{len(df)})")
-    print(f"Tahmin Dağılımı (v3)                  : Ort = {df['predicted_rating'].mean():.1f} | Std = {df['predicted_rating'].std():.1f} | Min = {df['predicted_rating'].min():.0f} | Max = {df['predicted_rating'].max():.0f}")
+    print(f"Tahmin Dağılımı (v4)                  : Ort = {df['predicted_rating'].mean():.1f} | Std = {df['predicted_rating'].std():.1f} | Min = {df['predicted_rating'].min():.0f} | Max = {df['predicted_rating'].max():.0f}")
     print(f"1550 Rapid Başarı Oranı Korelasyonu   : Pearson r = {r_1550:.4f} (p={p_1550:.2e}) | Spearman rho = {rho_1550:.4f}")
     print(f"2050 Rapid Başarı Oranı Korelasyonu   : Pearson r = {r_2050:.4f}")
     print(f"%50 Eşiği Geçen Grup (n={len(implied_elos)}) Uyumu  : r = {mid_r:.4f} | IRT Eşik MAE = {mid_mae:.1f} Elo")
-    print("\nAmpirik İnsan Zorluk Gruplarına Göre v3 Tahmin Ortalamaları:")
+    print("\nAmpirik İnsan Zorluk Gruplarına Göre v4 Tahmin Ortalamaları:")
     for grp_name in ["Kolay (<1050 Ima)", "Orta/Ileri (1050-2050)", "Zor (>2050 Ima)"]:
         sub = df[df["empirical_group"] == grp_name]
-        print(f"  - {grp_name:24s} (n={len(sub):4d}): Ort. v3 Tahmini = {sub['predicted_rating'].mean():.1f} Elo | Ort. Rapid-1550 Başarı = %{sub['success_prob_rapid_1550'].mean()*100:.1f}")
+        print(f"  - {grp_name:24s} (n={len(sub):4d}): Ort. v4 Tahmini = {sub['predicted_rating'].mean():.1f} Elo | Ort. Rapid-1550 Başarı = %{sub['success_prob_rapid_1550'].mean()*100:.1f}")
 
-    kept = df[df["keep_90pct_mask"] == 1]
-    dropped = df[df["keep_90pct_mask"] == 0]
-    print(f"\n%90 Kapsama Maskesi Özeti -> Tutulan (n={len(kept)}): Ort. Ply = {kept['solution_ply'].mean():.2f} | Elenen Belirsiz %10 (n={len(dropped)}): Ort. Ply = {dropped['solution_ply'].mean():.2f}")
     return df
 
 
 def plot_fig1_architecture_evolution():
     stages = [
-        "Ortalama Taban\n(Baseline)",
+        "Ortalama\n(Baseline)",
         "v1: Yapısal\n(56 Özellik)",
-        "v2: Hibrit Ply-1\n(70 Özellik)",
-        "v3: Tam Hibrit\n(84 Özellik)",
+        "v2: Ply-1\n(70 Özellik)",
+        "v3: Ply-1&3\n(84 Özellik)",
+        "v3.1: RD+Unc\n(84 Özellik)",
+        "v4: Bilişsel\n(107 Özellik)",
     ]
-    rmse_vals = [476.32, 282.71, 261.68, 241.38]
-    mae_vals = [396.99, 220.57, 201.49, 185.54]
+    rmse_vals = [476.32, 282.71, 261.68, 241.38, 241.15, 231.97]
+    mae_vals = [396.99, 220.57, 201.49, 185.54, 185.26, 178.74]
 
-    if (V1_DIR / "ablation_structural_only.csv").exists():
-        rmse_vals[1] = float(pd.read_csv(V1_DIR / "ablation_structural_only.csv").iloc[-1]["Test_RMSE"])
-        mae_vals[1] = float(pd.read_csv(V1_DIR / "ablation_structural_only.csv").iloc[-1]["Test_MAE"])
-    if (V2_DIR / "ablation_hybrid_maia2.csv").exists():
-        rmse_vals[2] = float(pd.read_csv(V2_DIR / "ablation_hybrid_maia2.csv").iloc[-1]["Test_RMSE"])
-        mae_vals[2] = float(pd.read_csv(V2_DIR / "ablation_hybrid_maia2.csv").iloc[-1]["Test_MAE"])
-    if (V3_DIR / "ablation_v3_full.csv").exists():
-        rmse_vals[3] = float(pd.read_csv(V3_DIR / "ablation_v3_full.csv").iloc[-1]["Test_RMSE"])
-        mae_vals[3] = float(pd.read_csv(V3_DIR / "ablation_v3_full.csv").iloc[-1]["Test_MAE"])
+    ablation_files = [
+        (1, V1_DIR / "ablation_structural_only.csv"),
+        (2, V2_DIR / "ablation_hybrid_maia2.csv"),
+        (3, V3_DIR / "ablation_v3_full.csv"),
+        (4, V31_DIR / "ablation_v3_1.csv"),
+        (5, V4_DIR / "ablation_v4.csv"),
+    ]
+    for idx, fpath in ablation_files:
+        if fpath.exists():
+            row = pd.read_csv(fpath).iloc[-1]
+            rmse_vals[idx] = float(row["Test_RMSE"])
+            mae_vals[idx] = float(row["Test_MAE"])
 
     x = np.arange(len(stages))
-    width = 0.35
+    width = 0.36
 
-    fig, ax = plt.subplots(figsize=(9, 5))
+    fig, ax = plt.subplots(figsize=(10.5, 5.2))
     b1 = ax.bar(x - width / 2, rmse_vals, width, label="Test RMSE (Elo)", color="#1f4e78")
     b2 = ax.bar(x + width / 2, mae_vals, width, label="Test MAE (Elo)", color="#4b9cd3")
+    b1[-1].set_color("#2a9d8f")
+    b2[-1].set_color("#6ec6b8")
 
     for bar in b1:
         h = bar.get_height()
-        ax.annotate(f"{h:.1f}", (bar.get_x() + bar.get_width() / 2, h + 5), ha="center", fontweight="bold", fontsize=9)
+        ax.annotate(f"{h:.1f}", (bar.get_x() + bar.get_width() / 2, h + 5), ha="center", fontweight="bold", fontsize=8.5)
     for bar in b2:
         h = bar.get_height()
-        ax.annotate(f"{h:.1f}", (bar.get_x() + bar.get_width() / 2, h + 5), ha="center", fontsize=9)
+        ax.annotate(f"{h:.1f}", (bar.get_x() + bar.get_width() / 2, h + 5), ha="center", fontsize=8.5)
 
     ax.set_ylabel("Hata Miktarı (Glicko-2 Elo)")
-    ax.set_title("Model Mimarisi Evrimine Göre Test Hatası Düşüşü (N = 482.428)")
+    ax.set_title("Model Mimarisi Evrimine Göre Test Hatası Düşüşü (v1 → v4 | N = 482.428)")
     ax.set_xticks(x)
     ax.set_xticklabels(stages)
     ax.set_ylim(0, max(rmse_vals) * 1.14)
@@ -328,7 +421,7 @@ def plot_fig2_actual_vs_predicted(y_true: np.ndarray, y_pred: np.ndarray):
     mae = mean_absolute_error(y_true, y_pred)
     r2 = r2_score(y_true, y_pred)
     stats_box = (
-        f"Test Kümesi: {len(y_true):,} bulmaca\n"
+        f"v4 Test Kümesi: {len(y_true):,} bulmaca\n"
         f"RMSE: {rmse:.2f} Elo\n"
         f"MAE: {mae:.2f} Elo\n"
         f"R²: {r2:.4f}"
@@ -346,8 +439,8 @@ def plot_fig2_actual_vs_predicted(y_true: np.ndarray, y_pred: np.ndarray):
     ax.set_xlim(500, 2900)
     ax.set_ylim(500, 2900)
     ax.set_xlabel("Gerçek Lichess Zorluk Puanı (Glicko-2)")
-    ax.set_ylabel("v3 Hibrit Model Tahmini (Glicko-2)")
-    ax.set_title("Gerçek ve Tahmin Edilen Zorluk Puanları Yoğunluk Dağılımı (v3)")
+    ax.set_ylabel("v4 Bilişsel Hibrit Model Tahmini (Glicko-2)")
+    ax.set_title("Gerçek ve Tahmin Edilen Zorluk Puanları Yoğunluk Dağılımı (v4)")
     ax.legend(loc="lower right", frameon=True)
     fig.tight_layout()
     fig.savefig(FIG_DIR / "fig2_gercek_vs_tahmin_yogunluk.png")
@@ -355,34 +448,36 @@ def plot_fig2_actual_vs_predicted(y_true: np.ndarray, y_pred: np.ndarray):
 
 
 def plot_fig3_feature_importance():
-    imp_path = V3_DIR / "feature_importance_v3_gain.csv"
+    imp_path = V4_DIR / "feature_importance_v4_gain.csv"
     if not imp_path.exists():
         return
     imp_df = pd.read_csv(imp_path)
-    top_df = imp_df.head(18).iloc[::-1]
+    top_df = imp_df.head(20).iloc[::-1]
 
     palette = {
         "structural": "#2b5c8f",
         "maia2_ply1": "#e07a5f",
         "maia2_ply3": "#3d85c6",
-        "maia2_interactions": "#2a9d8f",
+        "maia2_v4_cognitive": "#d95f02",
+        "v4_interactions": "#2a9d8f",
     }
     labels_tr = {
         "structural": "Yapısal Tahta (56)",
         "maia2_ply1": "Maia-2 Ply 1 (14)",
         "maia2_ply3": "Maia-2 Ply 3 (7)",
-        "maia2_interactions": "Zincirleme Etkileşim (7)",
+        "maia2_v4_cognitive": "Blitz/Rapid & Ply 5 (17)",
+        "v4_interactions": "Derin Etkileşim (13)",
     }
 
     colors = [palette.get(s, "#666666") for s in top_df["source"]]
 
     fig, (ax1, ax2) = plt.subplots(
-        1, 2, figsize=(12, 5.8), gridspec_kw={"width_ratios": [2.2, 1.0]}
+        1, 2, figsize=(12.5, 6.2), gridspec_kw={"width_ratios": [2.15, 1.05]}
     )
 
     ax1.barh(top_df["feature"], top_df["gain_pct"], color=colors)
     ax1.set_xlabel("Toplam Kazanç (Gain) Payı (%)")
-    ax1.set_title("En Belirleyici İlk 18 Öznitelik (v3 LightGBM)")
+    ax1.set_title("En Belirleyici İlk 20 Öznitelik (v4 LightGBM)")
 
     grp_df = imp_df.groupby("source")["gain_pct"].sum().sort_values(ascending=True)
     grp_names = [labels_tr.get(g, g) for g in grp_df.index]
@@ -390,10 +485,10 @@ def plot_fig3_feature_importance():
     bars = ax2.barh(grp_names, grp_df.values, color=grp_colors, height=0.55)
     for b in bars:
         w = b.get_width()
-        ax2.annotate(f"%{w:.1f}", (w + 0.8, b.get_y() + b.get_height() / 2), va="center", fontweight="bold")
+        ax2.annotate(f"%{w:.1f}", (w + 0.7, b.get_y() + b.get_height() / 2), va="center", fontweight="bold")
     ax2.set_xlim(0, max(grp_df.values) * 1.18)
     ax2.set_xlabel("Grup Toplam Payı (%)")
-    ax2.set_title("Öznitelik Ailelerinin Karar Ağırlığı")
+    ax2.set_title("107 Öznitelik Ailesinin Karar Ağırlığı")
 
     fig.tight_layout()
     fig.savefig(FIG_DIR / "fig3_oznitelik_onem_dagilimi.png")
@@ -413,11 +508,11 @@ def plot_fig4_calibration_and_uncertainty(y_true, y_ens, y_cal, uncertainty):
             mean_pred_cal.append(np.mean(y_cal[m]))
 
     ax1.plot([700, 2600], [700, 2600], "k--", linewidth=1.2, label="Mükemmel Kalibrasyon")
-    ax1.plot(mean_pred_ens, mean_true, "o--", color="#e07a5f", label="Ham 3'lü Topluluk")
-    ax1.plot(mean_pred_cal, mean_true, "s-", color="#1f4e78", linewidth=2, label="Artık + Kalibreli v3")
+    ax1.plot(mean_pred_ens, mean_true, "o--", color="#e07a5f", label="Ham 3'lü v4 Topluluk")
+    ax1.plot(mean_pred_cal, mean_true, "s-", color="#1f4e78", linewidth=2, label="Artık + B-Spline Kalibreli v4")
     ax1.set_xlabel("Ortalama Tahmin Edilen Puan (Elo)")
     ax1.set_ylabel("Ortalama Gerçek Lichess Puanı (Elo)")
-    ax1.set_title("Güvenilirlik (Kalibrasyon) Eğrisi")
+    ax1.set_title("Güvenilirlik (Kalibrasyon) Eğrisi (v4)")
     ax1.legend(frameon=True)
 
     sq_err = (y_true - y_cal) ** 2
@@ -427,10 +522,10 @@ def plot_fig4_calibration_and_uncertainty(y_true, y_ens, y_cal, uncertainty):
     rmses = [np.sqrt(np.mean(sorted_sq[: int(len(sorted_sq) * c)])) for c in coverages]
 
     ax2.plot(coverages * 100, rmses, "o-", color="#2a9d8f", linewidth=2)
-    ax2.axvline(90, color="#d9534f", linestyle="--", linewidth=1.2, label="%90 Kapsama (FedCSIS Maskesi)")
+    ax2.axvline(90, color="#d9534f", linestyle="--", linewidth=1.2, label="%90 Kapsama (222.2 RMSE)")
     ax2.set_xlabel("Değerlendirilen Test Verisi Oranı (%)")
     ax2.set_ylabel("Kalan Veri Üzerinde RMSE (Elo)")
-    ax2.set_title("Belirsizlik Tabanlı Reddetme (Risk-Coverage) Analizi")
+    ax2.set_title("Heteroscedastic Belirsizlik Tabanlı Reddetme Analizi")
     ax2.legend(frameon=True)
 
     fig.tight_layout()
@@ -453,7 +548,7 @@ def plot_fig5_tiered_errors(y_true: np.ndarray, y_pred: np.ndarray, tier_df: pd.
     ax1.set_xticks(x)
     ax1.set_xticklabels(labels_short)
     ax1.set_ylabel("Hata (Elo)")
-    ax1.set_title("Zorluk Kademelerine Göre RMSE ve MAE")
+    ax1.set_title("Zorluk Kademelerine Göre v4 RMSE ve MAE")
     ax1.legend(frameon=True)
 
     box_data = []
@@ -490,9 +585,9 @@ def plot_fig6_competition_validation(comp_df: pd.DataFrame):
         color="#1f4e78",
     )
     r_val, _ = pearsonr(comp_df["predicted_rating"], comp_df["success_prob_rapid_1550"])
-    ax1.set_xlabel("v3 Kör Model Tahmini (Glicko-2 Elo)")
+    ax1.set_xlabel("v4 Kör Model Tahmini (Glicko-2 Elo)")
     ax1.set_ylabel("Gerçek 1550 Elo İnsan Çözüm Başarısı (%)")
-    ax1.set_title(f"FedCSIS 2025 Kör Test: Tahmin vs. İnsan Başarısı (r = {r_val:.3f})")
+    ax1.set_title(f"FedCSIS 2025 Kör Test: v4 Tahmin vs. İnsan Başarısı (r = {r_val:.3f})")
 
     groups = ["Kolay (<1050 Ima)", "Orta/Ileri (1050-2050)", "Zor (>2050 Ima)"]
     group_labels = ["Kolay\n(Tüm Elo >%50)", "Orta / İleri\n(%50 Eşiği Geçen)", "Zor\n(2050 Elo <%50)"]
@@ -507,8 +602,8 @@ def plot_fig6_competition_validation(comp_df: pd.DataFrame):
     )
     for patch, c in zip(bp["boxes"], ["#cdeac0", "#dbe9f6", "#f7cad0"]):
         patch.set_facecolor(c)
-    ax2.set_ylabel("v3 Kör Model Tahmini (Elo)")
-    ax2.set_title("Ampirik Zorluk Gruplarına Göre v3 Tahmin Ayrışması")
+    ax2.set_ylabel("v4 Kör Model Tahmini (Elo)")
+    ax2.set_title("Ampirik Zorluk Gruplarına Göre v4 Tahmin Ayrışması")
 
     fig.tight_layout()
     fig.savefig(FIG_DIR / "fig6_yarisma_dis_dogrulama.png")
@@ -520,26 +615,32 @@ def main():
     FIG_DIR.mkdir(parents=True, exist_ok=True)
     TBL_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("[Bölüm A] Ana test kümesi (N = 482.428) yarışma metrikleri hesaplanıyor...")
-    y_test, test_ens, test_cal, uncertainty = load_v3_test_predictions()
+    print("[Bölüm A] Ana test kümesi (N = 482.428) v4 yarışma metrikleri hesaplanıyor...")
+    y_test, test_ens, test_cal, uncertainty = load_v4_test_predictions()
     comp_m = compute_competition_metrics(y_test, test_cal, uncertainty)
 
-    print("\n================ FEDCSIS 2025 RESMİ METRİKLERİ (v3 - 482.428 TEST) ================")
+    print("\n================ FEDCSIS 2025 RESMİ METRİKLERİ (v4 - 482.428 TEST) ================")
     print(f"1. Tam Küme MSE (%100 Veri)          : {comp_m['full_mse']:,.2f} (RMSE: {comp_m['full_rmse']:.3f} | MAE: {comp_m['full_mae']:.3f} | R2: {comp_m['full_r2']:.4f})")
     print(f"2. %90 Kapsama Masked MSE            : {comp_m['masked_mse_90']:,.2f} (Masked RMSE: {comp_m['masked_rmse_90']:.3f})")
     print(f"3. Teorik En İyi (Oracle %90) MSE    : {comp_m['oracle_mse_90']:,.2f}")
     print(f"4. FedCSIS 2025 N/P Oranı            : {comp_m['np_ratio']:.3f}")
 
     tier_df = compute_stratified_table(y_test, test_cal)
-    tier_df.to_csv(TBL_DIR / "katmanli_zorluk_analizi.csv", index=False)
+    tier_df.to_csv(TBL_DIR / "katmanli_zorluk_analizi_v4.csv", index=False)
 
-    print("\n================ ZORLUK KADEMELERİNE GÖRE v3 HATA ANALİZİ ================")
+    print("\n================ ZORLUK KADEMELERİNE GÖRE v4 HATA ANALİZİ ================")
     print(tier_df.to_string(index=False))
+
+    theme_df = compute_theme_error_table(y_test, test_cal)
+    if theme_df is not None:
+        theme_df.to_csv(TBL_DIR / "tema_bazli_hata_analizi_v4.csv", index=False)
+        print("\n================ TAKTİK MOTİF (TEMA) BAZLI v4 HATA ANALİZİ ================")
+        print(theme_df.to_string(index=False))
 
     comp_csv = next((p for p in COMP_CSV_CANDIDATES if p.exists()), None)
     comp_df = evaluate_competition_blind_csv(comp_csv)
 
-    print("\n[Bölüm C] 300 DPI tez ve yarışma grafikleri üretiliyor...")
+    print("\n[Bölüm C] 300 DPI tez ve yarışma grafikleri (v4) üretiliyor...")
     plot_fig1_architecture_evolution()
     plot_fig2_actual_vs_predicted(y_test, test_cal)
     plot_fig3_feature_importance()
@@ -548,7 +649,7 @@ def main():
     if comp_df is not None:
         plot_fig6_competition_validation(comp_df)
 
-    print(f"\nTüm test ve doğrulama çıktıları '{OUT_DIR}/' klasörüne kaydedildi.")
+    print(f"\nTüm v4 tez çıktıları ve grafikleri '{OUT_DIR}/' klasörüne kaydedildi.")
 
 
 if __name__ == "__main__":
